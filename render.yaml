@@ -1,0 +1,45 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# Deploy: Render Dashboard -> New -> Blueprint -> pick this repo.
+# Secrets marked `sync: false` are asked for once in the dashboard and never stored in git.
+services:
+  - type: web
+    name: cloudinary-impact-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: CLOUDINARY_ROOT_FOLDER
+        value: cloudinary_impact
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      # Your Vercel URL (no trailing slash). Add more origins separated by commas.
+      - key: CORS_ORIGINS
+        sync: false
+      # Optional: allow Vercel preview URLs, e.g. https://cloudinary-impact-.*\.vercel\.app
+      - key: CORS_ORIGIN_REGEX
+        sync: false

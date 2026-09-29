@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+backend/uploads/*
+!backend/uploads/.gitkeep
+*.db
+
+# Node
+node_modules/
+frontend/dist/
+frontend/vite.config.ts.timestamp-*
+.vercel
+
+# Local test artifacts
+backend/_*.py
+backend/_*.txt
+test_screenshots/
