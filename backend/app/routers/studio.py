@@ -11,6 +11,7 @@ request, is mapped to one of five renderers that produce the output with real Cl
   reel          one animated reel (GIF + MP4) from the folder's photos (Upload API `multi`)
   pack          ZIP of the untouched originals (signed, expiring link) + CSV of their details
 """
+import asyncio
 import csv
 import hashlib
 import io
@@ -29,10 +30,10 @@ from sqlalchemy.orm import selectinload
 from app.auth import get_current_user
 from app.cloudinary_service import before_after_url, create_reel, photo_pack_url, social_card_url
 from app.database import get_db
-from app.llm_client import load_asset_bytes
+from app.media_chat import spread
 from app.models import Comparison, Folder, ImpactReport, MediaAsset, User
 from app.routers.reports import serialize_creation
-from app.storage import StorageContext, creds_for_url, get_storage
+from app.storage import StorageContext, ai_image_bytes, creds_for_url, get_storage
 from app.vision_engine import AIError, VisionEngine
 
 router = APIRouter(prefix="/studio", tags=["Studio"])
@@ -143,11 +144,19 @@ def _clean_idea(raw: Dict[str, Any], kinds: Dict[str, str], valid_ids: set) -> O
     }
 
 
-def _context_block(folder: Folder, assets: List[MediaAsset], stats: Dict[str, Any]) -> str:
+CONTEXT_PHOTOS = 60
+
+
+def _context_block(folder: Folder, assets: List[MediaAsset], stats: Dict[str, Any], first_ids: Optional[List[int]] = None) -> str:
+    """Metadata the model sees. Big folders: the chosen photos first, then an even spread over the whole folder."""
+    first = [a for a in assets if a.id in set(first_ids or [])]
+    rest = [a for a in assets if a not in first]
+    shown = first[:CONTEXT_PHOTOS] + spread(rest, max(0, CONTEXT_PHOTOS - len(first)))
+    note = f" (showing {len(shown)} of {len(assets)}, spread across the folder)" if len(shown) < len(assets) else ""
     return (
         f"Folder name: {folder.name}\n"
-        f"Folder stats: {json.dumps(stats)}\n"
-        f"Photos (metadata; ids are real): {json.dumps([_record(a) for a in assets[:60]], default=str)}"
+        f"Folder stats (all photos): {json.dumps(stats)}\n"
+        f"Photos{note} (metadata; ids are real): {json.dumps([_record(a) for a in shown], default=str)}"
     )
 
 
@@ -243,7 +252,7 @@ async def _render_document(folder, assets, stats, idea, ctx) -> Dict[str, Any]:
             f"Piece to write: {idea['title']}. {idea['description']}\n"
             f"Audience: {idea['audience'] or 'general'}. Tone: {idea['tone'] or 'clear and friendly'}.\n"
             f"Instructions: {idea['prompt']}\n\n"
-            f"{_context_block(folder, assets, stats)}\n"
+            f"{_context_block(folder, assets, stats, idea['asset_ids'])}\n"
             f"Photos to feature first: {idea['asset_ids']}"
         ),
         user_settings=ctx.settings,
@@ -327,15 +336,17 @@ async def _render_before_after(folder, assets, stats, idea, ctx, db, user) -> Di
     creds = creds_for_url(before.secure_url, ctx)
     if not creds or creds_for_url(after.secure_url, ctx) != creds:
         raise HTTPException(status_code=400, detail="Both photos must be in the same connected Cloudinary account.")
-    b_bytes = await load_asset_bytes(before.secure_url)
-    a_bytes = await load_asset_bytes(after.secure_url)
+    b_bytes, a_bytes = await asyncio.gather(
+        ai_image_bytes(before.cloudinary_public_id, before.secure_url, ctx),
+        ai_image_bytes(after.cloudinary_public_id, after.secure_url, ctx),
+    )
     comp = await VisionEngine.compare_images(b_bytes, a_bytes, f"{folder.name}: {idea['title']}", ctx.settings)
     try:
         score = float(comp.get("impact_score") or 0)
     except (TypeError, ValueError):
         score = 0.0
     db.add(Comparison(
-        user_id=user.id, title=f"{folder.name}: {before.original_name} → {after.original_name}",
+        user_id=user.id, title=f"{folder.name}: {before.original_name} → {after.original_name}"[:255],
         before_asset_id=before.id, after_asset_id=after.id,
         delta_summary=comp["delta_summary"], impact_score=score, metrics_diff=comp.get("metrics_diff") or {},
     ))
@@ -460,6 +471,13 @@ async def pack_link(creation_id: int, user: User = Depends(get_current_user), db
     return {"url": photo_pack_url(public_ids, ctx.creds, (r.payload or {}).get("zip_name") or r.title), "count": len(public_ids)}
 
 
+def _csv_safe(v: Any) -> Any:
+    """Stops spreadsheet apps from running text as a formula (CSV injection). Numbers pass through."""
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + v
+    return v
+
+
 @router.get("/folders/{folder_id}/details.csv")
 async def folder_csv(folder_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     folder, assets = await _folder_with_assets(db, user, folder_id)
@@ -468,12 +486,12 @@ async def folder_csv(folder_id: int, user: User = Depends(get_current_user), db:
     w.writerow(["file", "phase", "captured_at", "uploaded_at", "latitude", "longitude", "theme", "activity", "tags", "summary", "original_url"])
     for a in assets:
         an = a.ai_analysis if a.ai_status == "analyzed" else None
-        w.writerow([
+        w.writerow([_csv_safe(v) for v in [
             a.original_name, a.phase, a.captured_at.isoformat() if a.captured_at else "", a.created_at.isoformat() if a.created_at else "",
             a.latitude if a.latitude is not None else "", a.longitude if a.longitude is not None else "",
             an.project_category if an else "", (an.activity_detected or "") if an else "",
             "; ".join(an.visual_signals or []) if an else "", an.summary if an else "", a.secure_url,
-        ])
+        ]])
     return Response(
         content=buf.getvalue(), media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{folder.slug or "folder"}-details.csv"'},

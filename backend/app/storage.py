@@ -8,8 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import User, UserSettings
 from app.cloudinary_service import (
-    CloudinaryError, resolve_credentials, system_credentials, user_root_folder, ensure_folder, folder_segment,
+    CloudinaryError, ai_image_url, resolve_credentials, system_credentials, user_root_folder, ensure_folder, folder_segment,
 )
+from app.llm_client import load_asset_bytes
 
 
 @dataclass
@@ -41,6 +42,14 @@ async def get_storage(db: AsyncSession, user: User) -> StorageContext:
         user=user, settings=st, creds=creds, root=user.cloudinary_folder,
         mode="own" if own else "platform",
     )
+
+
+async def ai_image_bytes(public_id: str, secure_url: str, ctx: "StorageContext") -> bytes:
+    """Downloads the AI-ready JPG (max 1600px) that Cloudinary builds from an original."""
+    creds = creds_for_url(secure_url, ctx)
+    if not creds:
+        raise CloudinaryError("This photo is stored in a Cloudinary account that is no longer connected.")
+    return await load_asset_bytes(ai_image_url(public_id, creds))
 
 
 def creds_for_url(url: str, ctx: StorageContext) -> Optional[Dict[str, str]]:

@@ -159,6 +159,64 @@ def extract_image_metadata(file_bytes: bytes) -> Dict[str, Any]:
     return meta
 
 
+_DMS = re.compile(r"(\d+(?:\.\d+)?)\s*deg\s*(\d+(?:\.\d+)?)'\s*(\d+(?:\.\d+)?)\"?\s*([NSEW])?", re.I)
+
+
+def _cld_coord(value: Any, ref: Any) -> Optional[float]:
+    """Parses Cloudinary/exiftool coordinates like `12 deg 58' 3.60" N` or `12.9677`."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    m = _DMS.search(s)
+    if m:
+        deg = float(m.group(1)) + float(m.group(2)) / 60 + float(m.group(3)) / 3600
+        hemi = (m.group(4) or str(ref or "")[:1]).upper()
+    else:
+        try:
+            deg = float(s.split()[0])
+        except (ValueError, IndexError):
+            return None
+        hemi = str(ref or "")[:1].upper()
+    return -deg if hemi in ("S", "W") else deg
+
+
+def exif_from_cloudinary(upload_response: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Capture time + GPS from the EXIF Cloudinary returns on upload (media_metadata=True).
+    Used for formats Pillow can't open, e.g. iPhone HEIC photos.
+    """
+    md = upload_response.get("image_metadata") or upload_response.get("media_metadata") or {}
+    out: Dict[str, Any] = {"captured_at": None, "latitude": None, "longitude": None}
+    dt = md.get("DateTimeOriginal") or md.get("CreateDate")
+    if dt:
+        try:
+            out["captured_at"] = datetime.datetime.strptime(str(dt).strip()[:19], "%Y:%m:%d %H:%M:%S")
+        except ValueError:
+            pass
+    lat = _cld_coord(md.get("GPSLatitude"), md.get("GPSLatitudeRef"))
+    lon = _cld_coord(md.get("GPSLongitude"), md.get("GPSLongitudeRef"))
+    if lat is not None and lon is not None and -90 <= lat <= 90 and -180 <= lon <= 180:
+        out["latitude"], out["longitude"] = lat, lon
+    return out
+
+
+def ai_image_url(public_id: str, creds: Dict[str, str]) -> str:
+    """
+    What the AI model receives: a JPG no larger than 1600px built by Cloudinary from the original.
+    Works for HEIC and huge files (providers reject >~20 MB and most don't accept HEIC).
+    """
+    return cloudinary.CloudinaryImage(public_id).build_url(
+        transformation=[{"width": 1600, "height": 1600, "crop": "limit"}, {"quality": "auto"}],
+        format="jpg", secure=True, cloud_name=creds["cloud_name"],
+    )
+
+
+def layer_id(public_id: str) -> str:
+    """Public ID for use inside an l_ overlay: slashes become colons, each part URL-encoded (spaces in folder names)."""
+    from urllib.parse import quote
+    return ":".join(quote(part, safe="-_.~").replace("%2C", "%252C") for part in public_id.split("/"))
+
+
 def delivery_urls(public_id: str, resource_type: str, creds: Dict[str, str]) -> Dict[str, str]:
     """Optimized delivery (f_auto, q_auto) + thumbnail. The stored original is never altered."""
     opts = {"cloud_name": creds["cloud_name"], "secure": True, "resource_type": resource_type}
@@ -209,6 +267,9 @@ async def upload_asset(
 
     rtype = r.get("resource_type", "image")
     urls = delivery_urls(r["public_id"], rtype, creds)
+    if meta["format"] is None:
+        # Pillow couldn't open the file (e.g. HEIC): read the EXIF Cloudinary extracted instead
+        meta.update(exif_from_cloudinary(r))
     return {
         "public_id": r["public_id"],
         "secure_url": r["secure_url"],          # untouched original (traceability)
@@ -258,7 +319,7 @@ def social_card_url(public_id: str, creds: Dict[str, str], headline: str, captio
             {"effect": "blur:2000"},
             {"effect": "brightness:-15"},
             # the sharp original, fitted (not cropped) in the middle
-            {"overlay": public_id.replace("/", ":"), "width": W, "height": 1350, "crop": "fit"},
+            {"overlay": layer_id(public_id), "width": W, "height": 1350, "crop": "fit"},
             {"flags": "layer_apply", "gravity": "center"},
         ]
     else:
@@ -287,7 +348,7 @@ def before_after_url(before_id: str, after_id: str, creds: Dict[str, str], label
         {"width": half, "height": half, "crop": "fill", "gravity": "auto"},
         {"overlay": _text_layer(label_before, 40), "color": "white", "background": "rgb:b45309"},
         {"flags": "layer_apply", "gravity": "north_west", "x": 24, "y": 24},
-        {"overlay": after_id.replace("/", ":")},
+        {"overlay": layer_id(after_id)},
         {"width": half, "height": half, "crop": "fill", "gravity": "auto"},
         {"flags": "layer_apply", "gravity": "west", "x": half},
         {"overlay": _text_layer(label_after, 40), "color": "white", "background": "rgb:047857"},

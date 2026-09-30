@@ -4,7 +4,7 @@ Media Library chat agent.
 Lets users ask plain-language questions about their media and its metadata
 ("which photos have GPS?", "show before photos of the solar project", "what did we
 capture in March?"). It retrieves matching assets from the user's library, then either
-asks the configured LLM to answer over that metadata, or falls back to a rule-based answer.
+asks the configured LLM to answer over that metadata.
 """
 import json
 import re
@@ -17,8 +17,22 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import MediaAsset
+from app.storage import StorageContext, ai_image_bytes
 from app.vision_engine import AIError, VisionEngine
-from app.llm_client import load_asset_bytes
+
+FULL_CONTEXT_LIMIT = 150   # libraries up to this size are sent to the model in full
+MATCH_CONTEXT = 80         # bigger libraries: keyword matches first...
+SAMPLE_CONTEXT = 120       # ...topped up to this many with an even spread of the rest
+
+
+def spread(items: List[Any], n: int) -> List[Any]:
+    """n items evenly spaced across the list (keeps order), so big sets aren't judged by their first page."""
+    if n <= 0 or not items:
+        return []
+    if len(items) <= n:
+        return list(items)
+    step = len(items) / n
+    return [items[int(i * step)] for i in range(n)]
 
 MONTHS = {m: i for i, m in enumerate(
     ["january", "february", "march", "april", "may", "june", "july",
@@ -132,7 +146,7 @@ def _retrieve(message: str, records: List[Dict[str, Any]]) -> List[Dict[str, Any
 async def run_media_chat(
     db: AsyncSession,
     user_id: int,
-    user_settings: Optional[Any],
+    ctx: StorageContext,
     message: str,
     history: Optional[List[Dict[str, str]]] = None,
     asset_id: Optional[int] = None,
@@ -156,24 +170,37 @@ async def run_media_chat(
     attached = by_id.get(asset_id) if asset_id else None
     image_bytes = None
     if attached:
-        image_bytes = await load_asset_bytes(attached.secure_url)
+        image_bytes = await ai_image_bytes(attached.cloudinary_public_id, attached.secure_url, ctx)
         steps.append({"title": "Attached image", "detail": f"Looking at {attached.original_name}"})
 
-    # Keep the prompt bounded: send everything for small libraries, otherwise matches first
-    context_records = records if len(records) <= 120 else (matches[:60] or records[:60])
+    # Keep the prompt bounded. Small libraries: every photo. Big ones: keyword matches plus an even
+    # spread over the whole library, and the model is told exactly how many photos it can see.
+    if len(records) <= FULL_CONTEXT_LIMIT:
+        context_records = records
+    else:
+        picked = matches[:MATCH_CONTEXT]
+        seen = {r["id"] for r in picked}
+        rest = [r for r in records if r["id"] not in seen]
+        context_records = picked + spread(rest, max(0, SAMPLE_CONTEXT - len(picked)))
     for r in context_records:
         r["summary"] = (r["summary"] or "")[:240] or None
+    partial = len(context_records) < len(records)
 
     system = (
         "You are Buddy, the assistant for a media library built on Cloudinary. The photos can be about anything "
         "(field projects, events, trips, campaigns, daily life). "
         "Answer questions about the user's field photos using ONLY the metadata provided (and the attached image if any). "
         "Be concise and friendly, use short markdown (bold, bullet lists). If the data can't answer, say so and suggest "
-        "what metadata would help. Never invent assets, numbers, locations, or dates.\n"
+        "what metadata would help. Never invent assets, numbers, locations, or dates. The library stats always "
+        "cover every photo; use them for counts. If you only see part of the photos' metadata and the answer "
+        "depends on the rest, say so plainly.\n"
         'Reply with a JSON object: {"answer": "<markdown>", "asset_ids": [ids of assets you refer to, most relevant first]}'
     )
     user_text = (
-        f"Library stats:\n{json.dumps(stats)}\n\n"
+        f"Library stats (all {len(records)} photos):\n{json.dumps(stats)}\n\n"
+        + (f"NOTE: metadata below covers {len(context_records)} of {len(records)} photos "
+           f"(keyword matches first, then an even spread of the rest).\n\n" if partial else "")
+        +
         f"Assets pre-matched by keyword search (ids): {[m['id'] for m in matches[:30]]}\n\n"
         f"Asset metadata:\n{json.dumps(context_records, default=str)}\n\n"
         + (f"The attached image is asset id {attached.id} ({attached.original_name}).\n\n" if attached else "")
@@ -182,7 +209,7 @@ async def run_media_chat(
     trimmed_history = [h for h in (history or []) if h.get("content")][-8:]
 
     data = await VisionEngine.generate_json(
-        system, user_text, user_settings,
+        system, user_text, ctx.settings,
         images=[image_bytes] if image_bytes else None,
         history=trimmed_history,
     )

@@ -47,6 +47,7 @@ export interface MediaAssetItem {
   longitude?: number;
   phase: string;
   uploaded_at?: string;
+  upload_key?: string | null;
   ai_status: 'analyzed' | 'pending' | 'failed';
   /** Only set on upload responses when AI analysis failed (the photo itself is stored). */
   ai_error?: string | null;
@@ -241,6 +242,8 @@ export interface UploadOptions {
   folderName?: string;
   phase?: string;
   customTags?: string;
+  /** One id per selected file. Re-sending the same key never stores the photo twice. */
+  uploadKey?: string;
   signal?: AbortSignal;
   /** Bytes sent so far for this file (browser → backend). */
   onBytes?: (loaded: number, total: number) => void;
@@ -354,6 +357,7 @@ export const api = {
     if (opts.folderId) formData.append('folder_id', String(opts.folderId));
     else if (opts.folderName?.trim()) formData.append('folder_name', opts.folderName.trim());
     if (opts.customTags?.trim()) formData.append('custom_tags', opts.customTags.trim());
+    if (opts.uploadKey) formData.append('upload_key', opts.uploadKey);
     formData.append('phase', opts.phase || 'general');
 
     return new Promise((resolve, reject) => {
@@ -387,6 +391,11 @@ export const api = {
       xhr.onabort = () => reject(new UploadAbortedError());
       xhr.send(formData);
     });
+  },
+
+  /** Which of these upload keys the server actually stored (for uploads whose response was lost). */
+  uploadStatus(keys: string[]): Promise<MediaAssetItem[]> {
+    return request<MediaAssetItem[]>('/media/upload-status', { method: 'POST', body: JSON.stringify({ keys }) });
   },
 
   deleteAsset(id: number): Promise<any> {

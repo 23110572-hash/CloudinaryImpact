@@ -59,7 +59,7 @@ async def call_llm(
     json_mode: bool = False,
     history: Optional[List[dict]] = None,
     temperature: float = 0.3,
-    timeout: float = 45.0,
+    timeout: float = 120.0,
 ) -> str:
     """Calls the given provider and returns the assistant text."""
     provider = (provider or "").lower()

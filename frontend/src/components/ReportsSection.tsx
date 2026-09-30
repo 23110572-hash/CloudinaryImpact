@@ -120,6 +120,7 @@ export const ReportsSection: React.FC<ReportsSectionProps> = ({
 
   // ---------- History ----------
   const [reports, setReports] = useState<ReportItem[]>([]);
+  const [viewing, setViewing] = useState<ReportItem | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
 
@@ -190,12 +191,24 @@ export const ReportsSection: React.FC<ReportsSectionProps> = ({
   };
 
   const openPack = async (r: ReportItem) => {
+    // Open the tab inside the click itself: browsers block tabs opened after an await
+    const tabRef = window.open('about:blank', '_blank');
     setPackBusy('zip');
     setPackError(null);
     try {
       const { url } = await api.getPackLink(r.id);
-      window.open(url, '_blank', 'noopener');
+      if (tabRef) {
+        tabRef.opener = null;
+        tabRef.location.href = url;
+      } else {
+        // Pop-ups fully disabled: the ZIP is served as a download, so this page stays where it is
+        const a = document.createElement('a');
+        a.href = url;
+        a.rel = 'noreferrer';
+        a.click();
+      }
     } catch (e: any) {
+      tabRef?.close();
       setPackError(e.message);
     } finally {
       setPackBusy(null);
@@ -220,6 +233,7 @@ export const ReportsSection: React.FC<ReportsSectionProps> = ({
     try {
       await api.deleteReport(id);
       if (creation?.id === id) setCreation(null);
+      if (viewing?.id === id) setViewing(null);
       loadHistory();
     } catch (e: any) {
       setHistoryError(e.message);
@@ -630,7 +644,12 @@ export const ReportsSection: React.FC<ReportsSectionProps> = ({
         </div>
       )}
 
-      {tab === 'history' && (
+      {tab === 'history' && viewing && (
+        // Opened in place, so creations whose folder is gone (or older reports without one) still open
+        <div key="history-view" className="animate-fade-in">{renderCreation(viewing, () => setViewing(null))}</div>
+      )}
+
+      {tab === 'history' && !viewing && (
         <div key="history" className="animate-fade-in space-y-8">
           {historyLoading && <p className="text-center text-slate-500 text-sm">Loading…</p>}
           {historyError && (
@@ -647,7 +666,7 @@ export const ReportsSection: React.FC<ReportsSectionProps> = ({
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 {reports.map((r, i) => (
                   <div key={r.id} className="p-4 rounded-2xl bg-white/95 border border-sky-100 shadow-sm hover:shadow-md hover:-translate-y-0.5 transition-all flex items-start justify-between gap-3 opacity-0 animate-fade-in" style={{ animationDelay: `${i * 50}ms`, animationFillMode: 'forwards' }}>
-                    <button className="text-left flex-1 min-w-0" onClick={() => { setCreation(r); setFolderId(r.folder_id); setTab('studio'); if (r.folder_id && r.folder_id !== folderId) loadIdeas(r.folder_id); }}>
+                    <button className="text-left flex-1 min-w-0" onClick={() => setViewing(r)}>
                       <KindBadge kind={r.kind} />
                       <p className="mt-1 font-bold text-slate-900 truncate">{r.title}</p>
                       <p className="text-xs text-slate-500 mt-0.5">{r.category} · {new Date(r.created_at).toLocaleDateString()}</p>

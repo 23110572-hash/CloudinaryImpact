@@ -19,13 +19,22 @@ const BAR_CELLS = 20;
 type ItemStatus = 'queued' | 'sending' | 'processing' | 'done' | 'ai_failed' | 'failed' | 'cancelled';
 
 interface QueueItem {
+  /** Also sent to the server as upload_key, so a retry can never store the same photo twice. */
   key: string;
   file: File;
+  /** Phase chosen when the batch started (retries keep it even if the picker changes later). */
+  phase: string;
   status: ItemStatus;
   sent: number; // 0..1 of bytes sent
   error?: string;
   result?: MediaAssetItem;
 }
+
+/** Random id from the Web Crypto API (works on http and https). */
+const newKey = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
+
+/** Browsers often report HEIC/HEIF (iPhone) photos with an empty MIME type, so accept them by extension too. */
+const isPhoto = (f: File) => f.type.startsWith('image/') || /\.(heic|heif)$/i.test(f.name);
 
 // Subtle Web Audio click for tactile feedback
 const playHapticTone = (type: 'drop' | 'success') => {
@@ -86,7 +95,7 @@ export const UploadSection: React.FC<UploadSectionProps> = ({ folders, onUploadS
   const addFiles = (list: FileList | null) => {
     if (!list?.length) return;
     playHapticTone('drop');
-    const files = Array.from(list).filter((f) => f.type.startsWith('image/'));
+    const files = Array.from(list).filter(isPhoto);
     setSelectedFiles((prev) => [...prev, ...files]);
   };
 
@@ -101,6 +110,7 @@ export const UploadSection: React.FC<UploadSectionProps> = ({ folders, onUploadS
     setStartedAt(Date.now());
     setNow(Date.now());
     let next = 0;
+    const settled = new Set<string>(); // keys whose server response arrived
 
     const worker = async () => {
       while (next < queue.length && !controller.signal.aborted) {
@@ -109,13 +119,15 @@ export const UploadSection: React.FC<UploadSectionProps> = ({ folders, onUploadS
         try {
           const res = await api.uploadMedia(it.file, {
             folderId,
-            phase: selectedPhase,
+            phase: it.phase,
+            uploadKey: it.key,
             signal: controller.signal,
             onBytes: (loaded, total) => patch(it.key, loaded >= total ? { status: 'processing', sent: 1 } : { sent: loaded / total }),
           });
-          patch(it.key, res.ai_status === 'failed'
-            ? { status: 'ai_failed', result: res, error: res.ai_error || 'AI analysis failed' }
-            : { status: 'done', result: res });
+          settled.add(it.key);
+          patch(it.key, res.ai_status === 'analyzed'
+            ? { status: 'done', result: res }
+            : { status: 'ai_failed', result: res, error: res.ai_error || 'AI analysis failed' });
         } catch (e: any) {
           patch(it.key, e instanceof UploadAbortedError ? { status: 'cancelled' } : { status: 'failed', error: e.message });
         }
@@ -128,9 +140,31 @@ export const UploadSection: React.FC<UploadSectionProps> = ({ folders, onUploadS
     } else {
       playHapticTone('success');
     }
+    await confirmWithServer(queue.filter((it) => !settled.has(it.key)).map((it) => it.key));
     setRunning(false);
     abortRef.current = null;
     onUploadSuccess();
+  };
+
+  /**
+   * A lost response (network drop, cancel after the file was sent) doesn't mean the photo is missing.
+   * Ask the server which of the unconfirmed files it actually stored and show their real state.
+   */
+  const confirmWithServer = async (unconfirmed: string[]) => {
+    if (!unconfirmed.length) return;
+    let stored: MediaAssetItem[];
+    try {
+      stored = await api.uploadStatus(unconfirmed);
+    } catch {
+      return; // server unreachable: the items keep their real error and can be retried safely (same keys)
+    }
+    const byKey = new Map(stored.map((a) => [a.upload_key, a]));
+    setItems((prev) => prev.map((it) => {
+      const a = byKey.get(it.key);
+      if (!a) return it;
+      if (a.ai_status === 'analyzed') return { ...it, status: 'done', result: a, error: undefined };
+      return { ...it, status: 'ai_failed', result: a, error: a.ai_status === 'failed' ? 'AI analysis failed' : 'AI analysis did not finish' };
+    }));
   };
 
   const startUpload = async () => {
@@ -152,13 +186,14 @@ export const UploadSection: React.FC<UploadSectionProps> = ({ folders, onUploadS
       return;
     }
     folderIdRef.current = folderId;
-    const queue: QueueItem[] = selectedFiles.map((file, i) => ({ key: `${Date.now()}-${i}-${file.name}`, file, status: 'queued', sent: 0 }));
+    const queue: QueueItem[] = selectedFiles.map((file) => ({ key: newKey(), file, phase: selectedPhase, status: 'queued', sent: 0 }));
     setItems(queue);
     setSelectedFiles([]);
     await runQueue(queue, folderId);
   };
 
   const retryFailedUploads = async () => {
+    // Same keys as before: anything the server already stored is returned, not uploaded twice
     const failed = items.filter((it) => it.status === 'failed' || it.status === 'cancelled').map((it) => ({ ...it, status: 'queued' as ItemStatus, sent: 0 }));
     if (!failed.length || !folderIdRef.current) return;
     setItems((prev) => prev.map((it) => failed.find((f) => f.key === it.key) || it));
@@ -261,7 +296,7 @@ export const UploadSection: React.FC<UploadSectionProps> = ({ folders, onUploadS
               isDragging ? 'border-sky-500 bg-sky-100/90 scale-[1.01] shadow-2xl shadow-sky-400/30' : 'border-sky-300/80 hover:bg-sky-50/80 hover:border-sky-400'
             }`}
           >
-            <input ref={fileInputRef} type="file" multiple accept="image/*" onChange={(e) => { addFiles(e.target.files); e.target.value = ''; }} className="hidden" />
+            <input ref={fileInputRef} type="file" multiple accept="image/*,.heic,.heif" onChange={(e) => { addFiles(e.target.files); e.target.value = ''; }} className="hidden" />
             <div className="w-20 h-20 sm:w-24 sm:h-24 mx-auto rounded-full bg-gradient-to-tr from-sky-500 to-blue-600 flex items-center justify-center text-white mb-6 shadow-xl shadow-sky-500/25">
               <UploadCloud className={`w-10 h-10 sm:w-12 sm:h-12 ${isDragging ? 'animate-bounce' : ''}`} />
             </div>

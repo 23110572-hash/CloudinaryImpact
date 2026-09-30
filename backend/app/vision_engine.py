@@ -120,6 +120,9 @@ class VisionEngine:
             if prov in SUPPORTED_PROVIDER_IDS and len(key) > 8:
                 model = user_settings.active_model or SYSTEM_DEFAULT_MODELS.get(prov, "")
                 return prov, model, key
+            # BYOK users chose not to send photos through the platform account: never use the system key for them
+            name = next((p["name"] for p in SUPPORTED_PROVIDERS if p["id"] == prov), prov or "your provider")
+            raise AIError(f"Bring Your Own Key is on, but no {name} key is saved. Add it in Settings or switch to System Managed.")
 
         for prov, key in _system_keys():
             if key.strip():

@@ -14,8 +14,8 @@ class Settings(BaseSettings):
     VERSION: str = "1.0.0"
     API_V1_STR: str = "/api"
     
-    # Secret Key for JWT
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "cloudinary_super_secret_impact_key_2026_production")
+    # Secret Key for JWT (required: no built-in default, or anyone could forge logins)
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "")
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7 # 7 days
     
@@ -40,3 +40,6 @@ class Settings(BaseSettings):
         extra = "allow"
 
 settings = Settings()
+
+if not (settings.SECRET_KEY or "").strip():
+    raise RuntimeError("SECRET_KEY is not set. Add a long random value to .env (local) or the Render environment.")

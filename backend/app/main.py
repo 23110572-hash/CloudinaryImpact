@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import os
+import traceback
 
 from app.config import settings
 from app.database import engine, Base
@@ -21,6 +22,19 @@ app = FastAPI(
 #   CORS_ORIGINS=https://cloudinary-impact.vercel.app,http://localhost:3000
 # CORS_ORIGIN_REGEX optionally allows Vercel preview deployments, e.g. https://cloudinary-impact-.*\.vercel\.app
 _origins = [o.strip().rstrip("/") for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
+
+
+# Unexpected server errors must still carry CORS headers, otherwise the browser hides the real
+# error and reports a "network error". Registered before CORSMiddleware so CORS wraps it.
+@app.middleware("http")
+async def _unexpected_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as exc:  # noqa: BLE001
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"detail": f"Server error: {type(exc).__name__}. Please try again."})
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
@@ -110,6 +124,7 @@ _NEW_COLUMNS = {
     "users": {"cloudinary_folder": "VARCHAR(255)"},
     "folders": {"cloudinary_path": "VARCHAR(512)", "ideas": "JSON", "ideas_signature": "VARCHAR(128)"},
     "impact_reports": {"kind": "VARCHAR(32)", "folder_id": "INTEGER", "payload": "JSON"},
+    "media_assets": {"upload_key": "VARCHAR(64)"},
 }
 
 

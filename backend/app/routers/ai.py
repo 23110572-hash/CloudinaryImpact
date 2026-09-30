@@ -11,7 +11,7 @@ from app.models import User, UserSettings, MediaAsset, Comparison
 from app.auth import get_current_user
 from app.vision_engine import VisionEngine
 from app.media_chat import run_media_chat
-from app.llm_client import load_asset_bytes
+from app.storage import ai_image_bytes, get_storage
 
 router = APIRouter(prefix="/ai", tags=["AI Vision Intelligence"])
 
@@ -48,11 +48,11 @@ async def chat_with_library(req: ChatRequest, user: User = Depends(get_current_u
     """Plain-language Q&A over the user's media metadata (optionally with one attached image)."""
     if req.asset_id and not await _get_owned_asset(db, user, req.asset_id):
         raise HTTPException(status_code=404, detail="Attached asset not found")
-    user_settings = await _get_settings(db, user)
+    ctx = await get_storage(db, user)
     return await run_media_chat(
         db=db,
         user_id=user.id,
-        user_settings=user_settings,
+        ctx=ctx,
         message=req.message.strip(),
         history=[h.model_dump() if hasattr(h, "model_dump") else h.dict() for h in req.history],
         asset_id=req.asset_id,
@@ -68,11 +68,12 @@ async def compare_before_after(req: CompareRequest, user: User = Depends(get_cur
     if not before_asset or not after_asset:
         raise HTTPException(status_code=404, detail="Before or After asset not found")
 
-    user_settings = await _get_settings(db, user)
+    ctx = await get_storage(db, user)
     before_bytes, after_bytes = await asyncio.gather(
-        load_asset_bytes(before_asset.secure_url), load_asset_bytes(after_asset.secure_url)
+        ai_image_bytes(before_asset.cloudinary_public_id, before_asset.secure_url, ctx),
+        ai_image_bytes(after_asset.cloudinary_public_id, after_asset.secure_url, ctx),
     )
-    comp = await VisionEngine.compare_images(before_bytes, after_bytes, req.title, user_settings)
+    comp = await VisionEngine.compare_images(before_bytes, after_bytes, req.title, ctx.settings)
 
     try:
         score = float(comp.get("impact_score", 0) or 0)
@@ -81,7 +82,7 @@ async def compare_before_after(req: CompareRequest, user: User = Depends(get_cur
 
     comparison = Comparison(
         user_id=user.id,
-        title=req.title,
+        title=req.title[:255],
         before_asset_id=before_asset.id,
         after_asset_id=after_asset.id,
         delta_summary=comp.get("delta_summary", ""),

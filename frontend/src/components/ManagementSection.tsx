@@ -80,6 +80,7 @@ export const ManagementSection: React.FC<ManagementSectionProps> = ({
   const [newName, setNewName] = useState('');
   const [busy, setBusy] = useState(false);
   const [analyzingId, setAnalyzingId] = useState<number | null>(null);
+  const [bulk, setBulk] = useState<{ done: number; total: number; failed: number } | null>(null);
 
   useEffect(() => {
     if (!notice) return;
@@ -176,6 +177,38 @@ export const ManagementSection: React.FC<ManagementSectionProps> = ({
     } finally {
       setAnalyzingId(null);
     }
+  };
+
+  const pending = inFolder.filter((m) => m.resource_type === 'image' && m.ai_status !== 'analyzed');
+
+  /** Analyzes every not-yet-analyzed photo in the current view, 3 at a time. */
+  const analyzeAll = async () => {
+    const list = [...pending];
+    if (!list.length) return;
+    let done = 0;
+    let failed = 0;
+    let lastError = '';
+    setBulk({ done, total: list.length, failed });
+    let next = 0;
+    const worker = async () => {
+      while (next < list.length) {
+        const a = list[next++];
+        try {
+          await api.analyzeAsset(a.id);
+        } catch (e: any) {
+          failed += 1;
+          lastError = e.message;
+        }
+        done += 1;
+        setBulk({ done, total: list.length, failed });
+      }
+    };
+    await Promise.all([0, 1, 2].map(worker));
+    setBulk(null);
+    onRefreshData?.();
+    setNotice(failed
+      ? { ok: false, text: `${list.length - failed} of ${list.length} analyzed. ${failed} failed: ${lastError}` }
+      : { ok: true, text: `All ${list.length} photos analyzed.` });
   };
 
   const chip = (f: Facet) => {
@@ -327,10 +360,22 @@ export const ManagementSection: React.FC<ManagementSectionProps> = ({
           <section aria-label={currentFolder ? `Photos in ${currentFolder.name}` : 'All photos'} className="min-w-0">
             <div className="bg-white/95 p-4 rounded-3xl border border-sky-100 shadow-sm mb-5 space-y-3">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <h3 className="text-xl font-extrabold text-slate-900 truncate">
-                  {currentFolder?.name || 'All photos'}
-                  <span className="ml-2 text-sm font-bold text-slate-400">{filtered.length === inFolder.length ? inFolder.length : `${filtered.length} of ${inFolder.length}`}</span>
-                </h3>
+                <div className="flex flex-wrap items-center gap-3 min-w-0">
+                  <h3 className="text-xl font-extrabold text-slate-900 truncate">
+                    {currentFolder?.name || 'All photos'}
+                    <span className="ml-2 text-sm font-bold text-slate-400">{filtered.length === inFolder.length ? inFolder.length : `${filtered.length} of ${inFolder.length}`}</span>
+                  </h3>
+                  {(pending.length > 0 || bulk) && (
+                    <button
+                      onClick={analyzeAll}
+                      disabled={!!bulk}
+                      className="px-3 py-1.5 rounded-full bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold flex items-center gap-1.5 disabled:opacity-80"
+                    >
+                      <Sparkles className={`w-3.5 h-3.5 ${bulk ? 'animate-spin' : ''}`} />
+                      {bulk ? `Analyzing ${bulk.done}/${bulk.total}…` : `Analyze ${pending.length} photo${pending.length === 1 ? '' : 's'}`}
+                    </button>
+                  )}
+                </div>
                 <div className="relative w-full sm:w-80">
                   <label htmlFor="lib-search" className="sr-only">Search photos</label>
                   <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />

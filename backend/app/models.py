@@ -94,6 +94,8 @@ class MediaAsset(Base):
     # Project Phase
     phase = Column(String(32), default="general") # "before", "during", "after", "general"
     ai_status = Column(String(32), default="pending") # "pending", "analyzed", "failed"
+    # Client-generated id per selected file, so a retried upload never creates a duplicate
+    upload_key = Column(String(64), nullable=True, index=True)
     
     created_at = Column(DateTime, default=datetime.utcnow)
 
