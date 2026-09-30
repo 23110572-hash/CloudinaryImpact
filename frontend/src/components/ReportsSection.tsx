@@ -89,6 +89,28 @@ const saveBlob = (blob: Blob, name: string) => {
 
 const slug = (s: string) => s.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'creation';
 
+/**
+ * Written pieces made before this update carried a metadata header and a source-file list.
+ * Show just the piece: drop those header lines and everything from "## Source photos" on.
+ */
+const cleanDocument = (md: string) =>
+  md
+    .split(/\n##\s+(Source photos|Evidence appendix)/i)[0]
+    .split('\n')
+    .filter((line) => !/^\*\*(Folder|For|Photos|Prepared for|Scope|Evidence period|Generated with):\*\*/i.test(line.trim()))
+    .join('\n')
+    .trim();
+
+const EXT: Record<string, string> = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp', 'video/mp4': 'mp4' };
+
+/** Real file download (not a new tab). Social/before-after images are fetched as JPG for easy sharing. */
+async function downloadMedia(url: string, baseName: string) {
+  const res = await fetch(url.replace('/f_auto/', '/f_jpg/'));
+  if (!res.ok) throw new Error(`Download failed (${res.status})`);
+  const blob = await res.blob();
+  saveBlob(blob, `${baseName}.${EXT[blob.type] || url.split('?')[0].split('.').pop() || 'bin'}`);
+}
+
 export const ReportsSection: React.FC<ReportsSectionProps> = ({
   media, folders, selectedBefore, selectedAfter, onChangeBefore, onChangeAfter, onNavigate,
 }) => {
@@ -107,6 +129,31 @@ export const ReportsSection: React.FC<ReportsSectionProps> = ({
   const [copied, setCopied] = useState(false);
   const [packBusy, setPackBusy] = useState<'zip' | 'csv' | null>(null);
   const [packError, setPackError] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+
+  const download = async (url: string, name: string) => {
+    setDownloading(url);
+    setDownloadError(null);
+    try {
+      await downloadMedia(url, name);
+    } catch (e: any) {
+      setDownloadError(e.message);
+    } finally {
+      setDownloading(null);
+    }
+  };
+
+  const downloadButton = (url: string, name: string, label: string) => (
+    <button
+      onClick={() => download(url, name)}
+      disabled={downloading !== null}
+      className="mt-2 inline-flex items-center gap-1 px-3 py-1.5 rounded-full bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold disabled:opacity-60 print:hidden"
+    >
+      {downloading === url ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+      {downloading === url ? 'Downloading…' : label}
+    </button>
+  );
 
   // ---------- Before & After ----------
   const [slider, setSlider] = useState(50);
@@ -309,7 +356,7 @@ export const ReportsSection: React.FC<ReportsSectionProps> = ({
             {p.videos.map((v) => (
               <div key={v.url}>
                 <video src={v.url} controls loop muted playsInline className="w-full max-w-xl mx-auto rounded-2xl bg-slate-950" />
-                <a href={v.url} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-xs font-bold text-sky-700 hover:underline"><Download className="w-3.5 h-3.5" /> {v.label}</a>
+                {downloadButton(v.url, `${slug(r.title)}-${v.format}`, `Download ${v.label}`)}
               </div>
             ))}
           </div>
@@ -322,14 +369,14 @@ export const ReportsSection: React.FC<ReportsSectionProps> = ({
                 <img src={img.url} alt={`${r.title} (${img.label})`} className={`w-full object-contain bg-slate-950 ${img.format === 'story' ? 'max-h-[34rem]' : ''}`} loading="lazy" />
                 <figcaption className="flex items-center justify-between gap-2 px-3 py-2 text-xs font-bold text-slate-600">
                   <span>{img.label}</span>
-                  <a href={img.url} target="_blank" rel="noreferrer" className="text-sky-700 hover:underline flex items-center gap-1"><Download className="w-3.5 h-3.5" /> Open full size</a>
+                  {downloadButton(img.url, `${slug(r.title)}-${img.format}`, 'Download')}
                 </figcaption>
               </figure>
             ))}
           </div>
         )}
 
-        {r.key_metrics?.length > 0 && (
+        {r.kind !== 'document' && r.key_metrics?.length > 0 && (
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
             {r.key_metrics.map((m, i) => (
               <div key={m.label} className="p-4 rounded-2xl bg-gradient-to-br from-sky-50 to-white border border-sky-100 opacity-0 animate-fade-in" style={{ animationDelay: `${i * 80}ms`, animationFillMode: 'forwards' }}>
@@ -358,8 +405,9 @@ export const ReportsSection: React.FC<ReportsSectionProps> = ({
         ) : r.kind === 'reel' || r.kind === 'pack' ? (
           <p className="text-slate-600">{r.markdown_content}</p>
         ) : (
-          <Markdown content={r.markdown_content} />
+          <Markdown content={r.kind === 'document' ? cleanDocument(r.markdown_content) : r.markdown_content} />
         )}
+        {downloadError && <p className="mt-3 text-sm text-rose-600 font-semibold flex items-center gap-1.5 print:hidden"><AlertCircle className="w-4 h-4" />{downloadError}</p>}
       </div>
     );
   };

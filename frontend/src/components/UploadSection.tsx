@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   UploadCloud, CheckCircle2, AlertCircle, Sparkles, FolderPlus, FileImage, X, ArrowRight, RotateCcw, Square,
 } from 'lucide-react';
-import { api, FolderItem, MediaAssetItem, UploadAbortedError } from '../services/api';
+import { api, FolderItem, MediaAssetItem, UploadAbortedError, UploadHttpError } from '../services/api';
 
 interface UploadSectionProps {
   folders: FolderItem[];
@@ -15,6 +15,9 @@ const CONCURRENCY = 3;
 /** Share of one file's progress that belongs to sending bytes; the rest is Cloudinary storage + AI analysis. */
 const SEND_SHARE = 0.3;
 const BAR_CELLS = 20;
+/** After a lost response, how long to keep asking the server whether it stored the photo (20 × 3s = 1 min). */
+const CONFIRM_ATTEMPTS = 20;
+const CONFIRM_INTERVAL_MS = 3000;
 
 type ItemStatus = 'queued' | 'sending' | 'processing' | 'done' | 'ai_failed' | 'failed' | 'cancelled';
 
@@ -129,7 +132,25 @@ export const UploadSection: React.FC<UploadSectionProps> = ({ folders, onUploadS
             ? { status: 'done', result: res }
             : { status: 'ai_failed', result: res, error: res.ai_error || 'AI analysis failed' });
         } catch (e: any) {
-          patch(it.key, e instanceof UploadAbortedError ? { status: 'cancelled' } : { status: 'failed', error: e.message });
+          if (e instanceof UploadAbortedError) {
+            patch(it.key, { status: 'cancelled' });
+            continue;
+          }
+          // A dropped connection or server error doesn't mean the photo is missing: the server may have
+          // stored it (and may still be analyzing). Keep it "processing" while we ask the server.
+          const lost = e instanceof UploadHttpError && (e.status === 0 || e.status >= 500);
+          if (lost) {
+            patch(it.key, { status: 'processing', sent: 1 });
+            const stored = await waitForServer(it.key);
+            if (stored) {
+              settled.add(it.key);
+              patch(it.key, stored.ai_status === 'analyzed'
+                ? { status: 'done', result: stored, error: undefined }
+                : { status: 'ai_failed', result: stored, error: stored.ai_status === 'failed' ? 'AI analysis failed' : 'AI analysis did not finish' });
+              continue;
+            }
+          }
+          patch(it.key, { status: 'failed', error: e.message });
         }
       }
     };
@@ -144,6 +165,24 @@ export const UploadSection: React.FC<UploadSectionProps> = ({ folders, onUploadS
     setRunning(false);
     abortRef.current = null;
     onUploadSuccess();
+  };
+
+  /**
+   * Polls the server for one upload whose response was lost. Returns the stored photo once its AI step
+   * is finished (or the wait runs out), or null if the server never stored it.
+   */
+  const waitForServer = async (key: string): Promise<MediaAssetItem | null> => {
+    let found: MediaAssetItem | null = null;
+    for (let i = 0; i < CONFIRM_ATTEMPTS; i++) {
+      await new Promise((r) => setTimeout(r, CONFIRM_INTERVAL_MS));
+      try {
+        found = (await api.uploadStatus([key]))[0] || found;
+      } catch {
+        // server briefly unreachable (e.g. restarting): keep waiting
+      }
+      if (found && found.ai_status !== 'pending') return found;
+    }
+    return found;
   };
 
   /**
@@ -251,7 +290,7 @@ export const UploadSection: React.FC<UploadSectionProps> = ({ folders, onUploadS
             disabled={running}
             value={folderName}
             onChange={(e) => { setFolderName(e.target.value); if (errorMsg) setErrorMsg(''); }}
-            placeholder="Enter folder name, e.g. Kenya Reforestation 2026"
+            placeholder="Enter folder name"
             list="upload-folder-suggestions"
             className="w-full px-4 py-3 rounded-2xl border border-slate-300 bg-white text-slate-900 font-semibold text-sm sm:text-base focus:outline-none focus:ring-2 focus:ring-sky-500 placeholder:text-slate-400 shadow-sm disabled:opacity-60"
           />

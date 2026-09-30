@@ -246,6 +246,8 @@ async def _render_document(folder, assets, stats, idea, ctx) -> Dict[str, Any]:
         system=(
             "You write from photo evidence. Use ONLY the data given. Never invent numbers, names, places or outcomes; "
             "if something isn't shown by the data, say so plainly. Match the purpose, audience and tone requested. "
+            "Write for the reader, not about the data: don't list file names, photo counts, GPS/geotag stats, "
+            "phases or date ranges unless the request asks for them. "
             "Write GitHub-flavored markdown with ## headings, short paragraphs and bullet lists. No title line."
         ),
         user_text=(
@@ -257,35 +259,14 @@ async def _render_document(folder, assets, stats, idea, ctx) -> Dict[str, Any]:
         ),
         user_settings=ctx.settings,
     )
-    dr = stats["date_range"]
-    lines = [
-        f"# {idea['title']}",
-        f"**Folder:** {folder.name}  ",
-        *([f"**For:** {idea['audience']}  "] if idea["audience"] else []),
-        f"**Photos:** {stats['total']}" + (f" · captured {dr[0]} to {dr[1]}" if dr else "") + "  ",
-        "",
-        narrative.strip(),
-        "",
-        "## Source photos",
-    ]
+    # Just the piece itself: no metadata header, stats grid or file list (the source ids stay in the payload)
     featured = _pick(assets, idea["asset_ids"], images_only=False)
-    for a in featured[:50]:
-        meta = [a.phase or "general"]
-        if a.captured_at:
-            meta.append(f"{a.captured_at:%Y-%m-%d}")
-        if a.latitude is not None:
-            meta.append(f"{a.latitude:.4f}, {a.longitude:.4f}")
-        lines.append(f"- [{a.original_name}]({a.secure_url}) · {' · '.join(meta)}")
-    if len(featured) > 50:
-        lines.append(f"- …and {len(featured) - 50} more in the Media Library")
-    key_metrics = [
-        {"label": "Photos", "value": str(stats["total"])},
-        {"label": "Geotagged", "value": f"{stats['geotagged']} ({round(100 * stats['geotagged'] / stats['total'])}%)"},
-        {"label": "Before / After", "value": f"{stats['phases']['before']} / {stats['phases']['after']}"},
-        {"label": "Period", "value": f"{dr[0]} → {dr[1]}" if dr else "No capture dates"},
-    ]
     covers = [{"id": a.id, "url": a.thumbnail_url or a.secure_url} for a in _pick(assets, idea["asset_ids"])[:3]]
-    return {"markdown": "\n".join(lines), "key_metrics": key_metrics, "payload": {"cover_images": covers, "source_ids": [a.id for a in featured]}}
+    return {
+        "markdown": f"# {idea['title']}\n\n{narrative.strip()}",
+        "key_metrics": [],
+        "payload": {"cover_images": covers, "source_ids": [a.id for a in featured]},
+    }
 
 
 async def _render_social(folder, assets, stats, idea, ctx) -> Dict[str, Any]:

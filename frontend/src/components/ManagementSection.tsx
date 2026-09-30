@@ -276,7 +276,7 @@ export const ManagementSection: React.FC<ManagementSectionProps> = ({
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             maxLength={80}
-            placeholder="Folder name, e.g. Kenya Reforestation 2026"
+            placeholder="Folder name"
             className="flex-1 px-4 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
           />
           <div className="flex gap-2">

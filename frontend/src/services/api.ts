@@ -256,6 +256,16 @@ export class UploadAbortedError extends Error {
   }
 }
 
+/** Upload failure with the HTTP status (0 = the response never arrived, e.g. connection dropped). */
+export class UploadHttpError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'UploadHttpError';
+    this.status = status;
+  }
+}
+
 export const api = {
   isLoggedIn(): boolean {
     return !!localStorage.getItem('token');
@@ -338,8 +348,22 @@ export const api = {
     return request('/media/sync', { method: 'POST' });
   },
 
-  analyzeAsset(id: number): Promise<MediaAssetItem> {
-    return request<MediaAssetItem>(`/media/${id}/analyze`, { method: 'POST' });
+  getAsset(id: number): Promise<MediaAssetItem> {
+    return request<MediaAssetItem>(`/media/${id}`);
+  },
+
+  /**
+   * Runs AI analysis. If the request itself fails (e.g. the response is lost on a slow connection),
+   * the asset's real state is read back, so a finished analysis is never reported as an error.
+   */
+  async analyzeAsset(id: number): Promise<MediaAssetItem> {
+    try {
+      return await request<MediaAssetItem>(`/media/${id}/analyze`, { method: 'POST' });
+    } catch (e) {
+      const current = await request<MediaAssetItem>(`/media/${id}`).catch(() => null);
+      if (current?.ai_status === 'analyzed') return current;
+      throw e;
+    }
   },
 
   getMedia(params: { folder_id?: number; phase?: string; search?: string } = {}): Promise<MediaAssetItem[]> {
@@ -381,12 +405,12 @@ export const api = {
         } else {
           let msg = `Upload failed (${xhr.status})`;
           try { msg = JSON.parse(xhr.responseText).detail || msg; } catch { /* keep default */ }
-          reject(new Error(msg));
+          reject(new UploadHttpError(msg, xhr.status));
         }
       };
       xhr.onerror = () => {
         opts.signal?.removeEventListener('abort', onAbort);
-        reject(new Error('Network error during upload'));
+        reject(new UploadHttpError('The connection dropped before the server replied', 0));
       };
       xhr.onabort = () => reject(new UploadAbortedError());
       xhr.send(formData);

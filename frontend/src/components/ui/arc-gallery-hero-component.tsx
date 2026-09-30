@@ -138,9 +138,10 @@ export const ArcGalleryHero: React.FC<ArcGalleryHeroProps> = ({
           <h1 className="text-4xl sm:text-6xl lg:text-7xl font-extrabold tracking-tight text-slate-900 leading-[1.12]">
             Workplace for all your{' '}
             <span className="inline-block [perspective:600px]" aria-live="polite">
+              {/* Gradient text is clipped to its box; extra bottom padding keeps descenders (g, p, y) visible */}
               <span
                 key={wordIdx}
-                className="inline-block animate-word-in bg-gradient-to-r from-sky-600 via-blue-600 to-indigo-600 bg-[length:200%_auto] bg-clip-text text-transparent"
+                className="inline-block pb-[0.18em] -mb-[0.18em] animate-word-in bg-gradient-to-r from-sky-600 via-blue-600 to-indigo-600 bg-[length:200%_auto] bg-clip-text text-transparent"
               >
                 {ROTATING_WORDS[wordIdx]}
               </span>

@@ -102,7 +102,7 @@ Each suggestion or request is mapped to one of five outputs, all built on real C
 
 | Output | How it's made |
 |---|---|
-| Written piece (report, story, recap…) | LLM writes from the folder's real metadata only, ends with links to every source photo |
+| Written piece (report, story, recap…) | LLM writes from the folder's real metadata only; the source photo ids are saved with the creation |
 | Social post | Square 1080×1080 and story 1080×1920 images with headline + caption text layers (story fits the photo on a blurred copy of itself), plus post text and hashtags |
 | Before & After | Side-by-side 1600×800 image built with layer offsets, plus the vision model's description of the visible change |
 | Highlight reel | Upload API `multi` combines up to 20 photos into an animated GIF, delivered as MP4 too |

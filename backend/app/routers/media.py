@@ -473,3 +473,12 @@ async def sync_from_cloudinary(user: User = Depends(get_current_user), db: Async
             new_assets += 1
     await db.commit()
     return {"new_folders": new_folders, "new_assets": new_assets, "root_folder": ctx.root}
+
+
+# --------------------------------------------------------------------------- single asset
+# Registered last so the int path parameter never shadows /storage, /folders, etc.
+
+@router.get("/{asset_id}")
+async def get_asset(asset_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Current state of one asset (lets the UI confirm a result when a long request's response was lost)."""
+    return serialize_asset(await load_owned_asset(db, user, asset_id))
