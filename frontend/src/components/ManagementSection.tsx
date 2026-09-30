@@ -1,9 +1,9 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Folder, FolderPlus, Search, Tag, Calendar, MapPin, Sparkles, SplitSquareVertical, Trash2, ExternalLink,
-  Image as ImageIcon, RefreshCw, X, Cloud, AlertCircle, Check, UploadCloud,
+  Image as ImageIcon, RefreshCw, X, AlertCircle, Check, UploadCloud, Images,
 } from 'lucide-react';
-import { api, FolderItem, MediaAssetItem, StorageInfo } from '../services/api';
+import { api, FolderItem, MediaAssetItem } from '../services/api';
 
 interface ManagementSectionProps {
   folders: FolderItem[];
@@ -15,13 +15,14 @@ interface ManagementSectionProps {
   onRefreshData?: () => void;
 }
 
-const PHASES = [
-  { id: 'all', label: 'All' },
-  { id: 'before', label: 'Before' },
-  { id: 'during', label: 'During' },
-  { id: 'after', label: 'After' },
-  { id: 'general', label: 'General' },
-];
+interface Facet {
+  key: string;
+  label: string;
+  count: number;
+  group: 'phase' | 'status' | 'theme' | 'tag';
+}
+
+const PHASE_LABEL: Record<string, string> = { before: 'Before', during: 'During', after: 'After', general: 'General' };
 
 const phaseStyle = (p: string) =>
   p === 'before' ? 'bg-amber-500 text-white'
@@ -32,26 +33,53 @@ const phaseStyle = (p: string) =>
 const fmtDate = (d?: string) => (d ? new Date(d).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }) : null);
 const fmtSize = (b: number) => (b > 1024 * 1024 ? `${(b / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`);
 
+/** Does this asset carry the given facet key? Keys: phase:x, status:gps, status:needs-ai, theme:x, tag:x */
+export function hasFacet(a: MediaAssetItem, key: string): boolean {
+  const [group, ...rest] = key.split(':');
+  const value = rest.join(':');
+  if (group === 'phase') return a.phase === value;
+  if (group === 'status') return value === 'gps' ? a.latitude != null : a.ai_status !== 'analyzed';
+  if (group === 'theme') return a.ai_analysis?.project_category === value;
+  if (group === 'tag') return !!a.ai_analysis?.visual_signals?.includes(value);
+  return false;
+}
+
+/** Every filterable attribute in a set of photos, with counts, most useful first. */
+export function buildFacets(list: MediaAssetItem[]): Facet[] {
+  const counts = new Map<string, Facet>();
+  const bump = (key: string, label: string, group: Facet['group']) => {
+    const f = counts.get(key) || { key, label, count: 0, group };
+    f.count += 1;
+    counts.set(key, f);
+  };
+  for (const a of list) {
+    bump(`phase:${a.phase}`, PHASE_LABEL[a.phase] || a.phase, 'phase');
+    if (a.latitude != null) bump('status:gps', 'Has GPS', 'status');
+    if (a.ai_status !== 'analyzed') bump('status:needs-ai', 'Not analyzed', 'status');
+    if (a.ai_analysis?.project_category) bump(`theme:${a.ai_analysis.project_category}`, a.ai_analysis.project_category, 'theme');
+    for (const t of new Set(a.ai_analysis?.visual_signals || [])) bump(`tag:${t}`, t, 'tag');
+  }
+  const order = { phase: 0, status: 1, theme: 2, tag: 3 };
+  return [...counts.values()].sort((x, y) => order[x.group] - order[y.group] || y.count - x.count || x.label.localeCompare(y.label));
+}
+
+const TAG_PREVIEW = 18;
+
 export const ManagementSection: React.FC<ManagementSectionProps> = ({
   folders, media, onDeleteAsset, onSelectForUnderstand, onSelectForCompare, setActiveTab, onRefreshData,
 }) => {
-  const [folderId, setFolderId] = useState<number | null>(null);
-  const [phase, setPhase] = useState('all');
+  const [folderId, setFolderId] = useState<number | null>(folders[0]?.id ?? null);
   const [query, setQuery] = useState('');
+  const [active, setActive] = useState<string[]>([]);
+  const [showAllTags, setShowAllTags] = useState(false);
   const [detail, setDetail] = useState<MediaAssetItem | null>(null);
 
-  const [storage, setStorage] = useState<StorageInfo | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
-
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
   const [busy, setBusy] = useState(false);
   const [analyzingId, setAnalyzingId] = useState<number | null>(null);
-
-  useEffect(() => {
-    api.getStorage().then(setStorage).catch(() => setStorage(null));
-  }, []);
 
   useEffect(() => {
     if (!notice) return;
@@ -59,22 +87,37 @@ export const ManagementSection: React.FC<ManagementSectionProps> = ({
     return () => clearTimeout(t);
   }, [notice]);
 
-  // Drop the folder filter if that folder disappears
+  // Drop the folder selection if that folder disappears
   useEffect(() => {
-    if (folderId && !folders.some((f) => f.id === folderId)) setFolderId(null);
+    if (folderId && !folders.some((f) => f.id === folderId)) setFolderId(folders[0]?.id ?? null);
   }, [folders, folderId]);
+
+  // Filters belong to a folder; reset them when switching
+  useEffect(() => {
+    setActive([]);
+    setQuery('');
+    setShowAllTags(false);
+  }, [folderId]);
+
+  const inFolder = useMemo(() => (folderId ? media.filter((m) => m.folder?.id === folderId) : media), [media, folderId]);
+  const facets = useMemo(() => buildFacets(inFolder), [inFolder]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return media.filter((m) => {
-      if (folderId && m.folder?.id !== folderId) return false;
-      if (phase !== 'all' && m.phase !== phase) return false;
+    return inFolder.filter((m) => {
+      if (!active.every((k) => hasFacet(m, k))) return false;
       if (!q) return true;
       const an = m.ai_analysis;
-      return [m.original_name, m.folder?.name, an?.summary, an?.project_category, ...(an?.visual_signals || [])]
+      return [m.original_name, an?.summary, an?.project_category, an?.activity_detected, ...(an?.visual_signals || [])]
         .some((v) => v && String(v).toLowerCase().includes(q));
     });
-  }, [media, folderId, phase, query]);
+  }, [inFolder, active, query]);
+
+  const currentFolder = folders.find((f) => f.id === folderId) || null;
+  const nonTag = facets.filter((f) => f.group !== 'tag');
+  const tags = facets.filter((f) => f.group === 'tag');
+  const visibleTags = showAllTags ? tags : tags.slice(0, TAG_PREVIEW);
+  const toggle = (key: string) => setActive((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
 
   const sync = async () => {
     setSyncing(true);
@@ -116,7 +159,6 @@ export const ManagementSection: React.FC<ManagementSectionProps> = ({
     if (!window.confirm(`Delete the empty folder "${f.name}"?`)) return;
     try {
       await api.deleteFolder(f.id);
-      if (folderId === f.id) setFolderId(null);
       onRefreshData?.();
     } catch (e: any) {
       setNotice({ ok: false, text: e.message });
@@ -136,45 +178,50 @@ export const ManagementSection: React.FC<ManagementSectionProps> = ({
     }
   };
 
-  const storageLabel = storage
-    ? storage.mode === 'local' ? 'Local storage (Cloudinary not configured)'
-      : `Cloudinary · ${storage.root_folder}`
-    : null;
+  const chip = (f: Facet) => {
+    const on = active.includes(f.key);
+    return (
+      <button
+        key={f.key}
+        onClick={() => toggle(f.key)}
+        aria-pressed={on}
+        className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold border transition-all ${
+          on ? 'bg-sky-600 text-white border-sky-600 shadow-sm'
+          : f.group === 'phase' ? 'bg-white text-slate-700 border-slate-200 hover:border-sky-300'
+          : f.group === 'status' ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:border-emerald-400'
+          : f.group === 'theme' ? 'bg-indigo-50 text-indigo-800 border-indigo-200 hover:border-indigo-400'
+          : 'bg-sky-50 text-sky-800 border-sky-100 hover:border-sky-300'
+        }`}
+      >
+        {f.group === 'tag' && <Tag className="w-2.5 h-2.5" />}
+        {f.group === 'status' && f.key === 'status:gps' && <MapPin className="w-2.5 h-2.5" />}
+        <span className="capitalize">{f.label}</span>
+        <span className={on ? 'text-white/80' : 'text-slate-400'}>{f.count}</span>
+      </button>
+    );
+  };
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8">
       {/* Header */}
-      <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 mb-8">
+      <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 mb-6">
         <div>
           <h2 className="text-3xl sm:text-4xl font-extrabold text-slate-900 tracking-tight">Media Library</h2>
-          <p className="mt-1 text-base sm:text-lg text-slate-600">Every photo is organized by folder, phase and location.</p>
-          {storageLabel && (
-            <p className="mt-2 inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500 bg-white/80 px-2.5 py-1 rounded-full border border-sky-100">
-              <Cloud className="w-3.5 h-3.5 text-sky-600" /> {storageLabel}
-            </p>
-          )}
+          <p className="mt-1 text-base sm:text-lg text-slate-600">Pick a folder, then search or filter by any tag.</p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <button
-            onClick={() => setCreating(true)}
-            className="px-4 py-2.5 rounded-xl bg-white hover:bg-sky-50 text-sky-700 font-bold text-sm flex items-center gap-1.5 border border-sky-200 shadow-sm"
-          >
+          <button onClick={() => setCreating(true)} className="px-4 py-2.5 rounded-xl bg-white hover:bg-sky-50 text-sky-700 font-bold text-sm flex items-center gap-1.5 border border-sky-200 shadow-sm">
             <FolderPlus className="w-4 h-4" /> New folder
           </button>
-          {storage?.mode !== 'local' && (
-            <button
-              onClick={sync}
-              disabled={syncing}
-              className="px-4 py-2.5 rounded-xl bg-white hover:bg-sky-50 text-sky-700 font-bold text-sm flex items-center gap-1.5 border border-sky-200 shadow-sm disabled:opacity-60"
-              title="Import photos you added to your Cloudinary folder outside this app"
-            >
-              <RefreshCw className={`w-4 h-4 ${syncing ? 'animate-spin' : ''}`} /> Sync
-            </button>
-          )}
           <button
-            onClick={() => setActiveTab('upload')}
-            className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-sky-600 to-blue-600 text-white font-bold text-sm flex items-center gap-1.5 shadow-md shadow-sky-600/20"
+            onClick={sync}
+            disabled={syncing}
+            className="px-4 py-2.5 rounded-xl bg-white hover:bg-sky-50 text-sky-700 font-bold text-sm flex items-center gap-1.5 border border-sky-200 shadow-sm disabled:opacity-60"
+            title="Import photos you added to your Cloudinary folder outside this app"
           >
+            <RefreshCw className={`w-4 h-4 ${syncing ? 'animate-spin' : ''}`} /> Sync
+          </button>
+          <button onClick={() => setActiveTab('upload')} className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-sky-600 to-blue-600 text-white font-bold text-sm flex items-center gap-1.5 shadow-md shadow-sky-600/20">
             <UploadCloud className="w-4 h-4" /> Upload
           </button>
         </div>
@@ -210,167 +257,203 @@ export const ManagementSection: React.FC<ManagementSectionProps> = ({
         </form>
       )}
 
-      {/* Folders */}
-      {folders.length > 0 && (
-        <section className="mb-8">
-          <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2 mb-4">
-            <Folder className="w-5 h-5 text-sky-600" /> Folders ({folders.length})
-          </h3>
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-            <button
-              onClick={() => setFolderId(null)}
-              className={`p-4 rounded-2xl border text-left transition-all ${folderId === null ? 'bg-sky-600 text-white border-sky-600 shadow-lg shadow-sky-600/20' : 'bg-white/90 hover:bg-sky-50 text-slate-800 border-sky-100 shadow-sm'}`}
-            >
-              <p className="font-bold truncate">All photos</p>
-              <p className={`text-xs mt-1 ${folderId === null ? 'text-white/80' : 'text-slate-500'}`}>{media.length} item{media.length === 1 ? '' : 's'}</p>
-            </button>
-            {folders.map((f) => {
-              const sel = folderId === f.id;
-              return (
-                <div key={f.id} className="relative group">
-                  <button
-                    onClick={() => setFolderId(f.id)}
-                    className={`w-full p-4 rounded-2xl border text-left transition-all ${sel ? 'bg-sky-600 text-white border-sky-600 shadow-lg shadow-sky-600/20' : 'bg-white/90 hover:bg-sky-50 text-slate-800 border-sky-100 shadow-sm'}`}
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: f.color || '#0284c7' }} />
-                      <p className="font-bold truncate">{f.name}</p>
-                    </div>
-                    <p className={`text-xs mt-1 ${sel ? 'text-white/80' : 'text-slate-500'}`}>{f.asset_count} item{f.asset_count === 1 ? '' : 's'}</p>
-                  </button>
-                  {f.asset_count === 0 && (
-                    <button
-                      onClick={() => deleteFolder(f)}
-                      className="absolute top-2 right-2 p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
-                      aria-label={`Delete folder ${f.name}`}
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
-
-      {/* Empty library */}
-      {media.length === 0 ? (
+      {media.length === 0 && folders.length === 0 ? (
         <div className="text-center py-16 bg-white/80 rounded-3xl border border-dashed border-sky-200 p-8">
           <ImageIcon className="w-12 h-12 text-sky-400 mx-auto mb-3" />
           <h4 className="text-xl font-bold text-slate-800">Your library is empty</h4>
-          <p className="text-sm text-slate-500 mt-1 max-w-md mx-auto">
-            Upload your first photos. They'll be stored in your own folder in Cloudinary and appear here.
-          </p>
-          <button onClick={() => setActiveTab('upload')} className="mt-5 px-6 py-2.5 rounded-full bg-sky-600 text-white font-bold text-sm shadow-md hover:bg-sky-700">
-            Upload photos
-          </button>
+          <p className="text-sm text-slate-500 mt-1 max-w-md mx-auto">Upload your first photos. They'll be stored in your own folder in Cloudinary and appear here.</p>
+          <button onClick={() => setActiveTab('upload')} className="mt-5 px-6 py-2.5 rounded-full bg-sky-600 text-white font-bold text-sm shadow-md hover:bg-sky-700">Upload photos</button>
         </div>
       ) : (
-        <>
-          {/* Search + phase filter */}
-          <div className="bg-white/95 p-3 rounded-2xl border border-sky-100 shadow-sm mb-6 flex flex-col md:flex-row md:items-center justify-between gap-3">
-            <div className="relative w-full md:w-96">
-              <label htmlFor="lib-search" className="sr-only">Search</label>
-              <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
-              <input
-                id="lib-search"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search by name, folder or tag…"
-                className="w-full pl-10 pr-4 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
-              />
-            </div>
-            <div className="flex items-center gap-1.5 overflow-x-auto" role="group" aria-label="Filter by phase">
-              {PHASES.map((p) => (
-                <button
-                  key={p.id}
-                  onClick={() => setPhase(p.id)}
-                  aria-pressed={phase === p.id}
-                  className={`px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap ${phase === p.id ? 'bg-sky-600 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-700'}`}
-                >
-                  {p.label}
-                </button>
-              ))}
-            </div>
+        <div className="grid grid-cols-1 lg:grid-cols-[17rem_1fr] gap-6 items-start">
+          {/* Folder list: stacked sidebar on desktop, dropdown on phones */}
+          <div className="lg:hidden">
+            <label htmlFor="folder-select" className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1.5">Folder</label>
+            <select
+              id="folder-select"
+              value={folderId ?? ''}
+              onChange={(e) => setFolderId(e.target.value ? Number(e.target.value) : null)}
+              className="w-full p-3 rounded-2xl border border-sky-200 bg-white text-sm font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-sky-500"
+            >
+              <option value="">All photos ({media.length})</option>
+              {folders.map((f) => <option key={f.id} value={f.id}>{f.name} ({f.asset_count})</option>)}
+            </select>
           </div>
 
-          {filtered.length === 0 ? (
-            <div className="text-center py-12 text-slate-500">
-              <p className="font-semibold">No photos match these filters.</p>
-              <button onClick={() => { setQuery(''); setPhase('all'); setFolderId(null); }} className="mt-2 text-sm font-bold text-sky-700 hover:underline">Clear filters</button>
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
-              {filtered.map((a, i) => (
-                <article
-                  key={a.id}
-                  className="bg-white rounded-2xl overflow-hidden border border-sky-100 shadow-sm hover:shadow-lg hover:-translate-y-0.5 transition-all duration-300 flex flex-col group opacity-0 animate-fade-in"
-                  style={{ animationDelay: `${Math.min(i, 12) * 40}ms`, animationFillMode: 'forwards' }}
-                >
-                  <button onClick={() => setDetail(a)} className="relative aspect-[4/3] w-full overflow-hidden bg-slate-100" aria-label={`Open ${a.original_name}`}>
-                    <img src={a.thumbnail_url || a.secure_url} alt={a.original_name} loading="lazy" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
-                    <span className={`absolute top-2.5 left-2.5 px-2 py-0.5 rounded-full text-[11px] font-extrabold uppercase ${phaseStyle(a.phase)}`}>{a.phase}</span>
-                  </button>
-
-                  <div className="p-4 flex-1 flex flex-col">
-                    <h4 className="font-bold text-slate-900 truncate" title={a.original_name}>{a.original_name}</h4>
-                    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
-                      {a.folder && <span className="flex items-center gap-1"><Folder className="w-3 h-3" />{a.folder.name}</span>}
-                      {(a.captured_at || a.uploaded_at) && (
-                        <span className="flex items-center gap-1" title={a.captured_at ? 'Captured (EXIF)' : 'Uploaded'}>
-                          <Calendar className="w-3 h-3" />{fmtDate(a.captured_at || a.uploaded_at)}
-                        </span>
-                      )}
-                      {a.latitude != null && <span className="flex items-center gap-1 text-emerald-700"><MapPin className="w-3 h-3" />GPS</span>}
-                    </div>
-
-                    {a.ai_analysis ? (
-                      <>
-                        <p className="mt-2 text-xs text-slate-600 line-clamp-2 leading-relaxed">{a.ai_analysis.summary}</p>
-                        {a.ai_analysis.visual_signals?.length > 0 && (
-                          <div className="mt-2 flex flex-wrap gap-1">
-                            {a.ai_analysis.visual_signals.slice(0, 3).map((s) => (
-                              <span key={s} className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-sky-50 text-sky-700 text-[11px] font-semibold border border-sky-100">
-                                <Tag className="w-2.5 h-2.5" />{s}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                      </>
-                    ) : (
+          <nav aria-label="Folders" className="hidden lg:block sticky top-6 bg-white/90 backdrop-blur-xl rounded-3xl border border-sky-100 shadow-sm p-2 max-h-[calc(100vh-3rem)] overflow-y-auto">
+            <p className="px-3 pt-2 pb-2 text-xs font-extrabold uppercase tracking-widest text-slate-500 flex items-center gap-1.5">
+              <Folder className="w-3.5 h-3.5 text-sky-600" /> Folders ({folders.length})
+            </p>
+            <button
+              onClick={() => setFolderId(null)}
+              aria-current={folderId === null ? 'true' : undefined}
+              className={`w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-2xl text-left text-sm font-bold transition-all ${folderId === null ? 'bg-sky-600 text-white shadow-md shadow-sky-600/20' : 'text-slate-700 hover:bg-sky-50'}`}
+            >
+              <span className="flex items-center gap-2 min-w-0"><Images className="w-4 h-4 shrink-0" /><span className="truncate">All photos</span></span>
+              <span className={`text-xs ${folderId === null ? 'text-white/80' : 'text-slate-400'}`}>{media.length}</span>
+            </button>
+            <ul className="mt-1 space-y-1">
+              {folders.map((f) => {
+                const sel = folderId === f.id;
+                return (
+                  <li key={f.id} className="group relative">
+                    <button
+                      onClick={() => setFolderId(f.id)}
+                      aria-current={sel ? 'true' : undefined}
+                      className={`w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-2xl text-left text-sm font-bold transition-all ${sel ? 'bg-sky-600 text-white shadow-md shadow-sky-600/20' : 'text-slate-700 hover:bg-sky-50'}`}
+                    >
+                      <span className="flex items-center gap-2 min-w-0">
+                        <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: f.color || '#0284c7' }} />
+                        <span className="truncate" title={f.name}>{f.name}</span>
+                      </span>
+                      <span className={`text-xs ${sel ? 'text-white/80' : 'text-slate-400'} ${f.asset_count === 0 ? 'group-hover:opacity-0' : ''}`}>{f.asset_count}</span>
+                    </button>
+                    {f.asset_count === 0 && (
                       <button
-                        onClick={() => analyze(a)}
-                        disabled={analyzingId === a.id}
-                        className="mt-2 self-start text-xs font-bold text-sky-700 hover:underline flex items-center gap-1 disabled:opacity-60"
+                        onClick={() => deleteFolder(f)}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 opacity-0 group-hover:opacity-100 focus:opacity-100"
+                        aria-label={`Delete empty folder ${f.name}`}
                       >
-                        <Sparkles className={`w-3 h-3 ${analyzingId === a.id ? 'animate-spin' : ''}`} />
-                        {analyzingId === a.id ? 'Analyzing…' : 'Not analyzed yet · Analyze'}
+                        <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     )}
+                  </li>
+                );
+              })}
+            </ul>
+          </nav>
 
-                    <div className="mt-auto pt-3 border-t border-slate-100 flex items-center justify-between">
-                      <div className="flex items-center gap-0.5">
-                        <button onClick={() => { onSelectForUnderstand(a); setActiveTab('buddy'); }} className="p-2 rounded-xl text-sky-600 hover:bg-sky-50" title="Ask Buddy about this photo" aria-label="Ask Buddy about this photo">
-                          <Sparkles className="w-4 h-4" />
+          {/* Photos of the selected folder */}
+          <section aria-label={currentFolder ? `Photos in ${currentFolder.name}` : 'All photos'} className="min-w-0">
+            <div className="bg-white/95 p-4 rounded-3xl border border-sky-100 shadow-sm mb-5 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <h3 className="text-xl font-extrabold text-slate-900 truncate">
+                  {currentFolder?.name || 'All photos'}
+                  <span className="ml-2 text-sm font-bold text-slate-400">{filtered.length === inFolder.length ? inFolder.length : `${filtered.length} of ${inFolder.length}`}</span>
+                </h3>
+                <div className="relative w-full sm:w-80">
+                  <label htmlFor="lib-search" className="sr-only">Search photos</label>
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                  <input
+                    id="lib-search"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search by name, tag or description…"
+                    className="w-full pl-10 pr-4 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                  />
+                </div>
+              </div>
+
+              {facets.length > 0 && (
+                <div className="space-y-2" role="group" aria-label="Filter by tag">
+                  <div className="flex flex-wrap gap-1.5">{nonTag.map(chip)}</div>
+                  {tags.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {visibleTags.map(chip)}
+                      {tags.length > TAG_PREVIEW && (
+                        <button onClick={() => setShowAllTags((s) => !s)} className="px-2.5 py-1 rounded-full text-xs font-bold text-sky-700 hover:underline">
+                          {showAllTags ? 'Show fewer' : `+${tags.length - TAG_PREVIEW} more`}
                         </button>
-                        <button onClick={() => { onSelectForCompare(a, a.phase === 'after' ? 'after' : 'before'); setActiveTab('reports'); }} className="p-2 rounded-xl text-indigo-600 hover:bg-indigo-50" title="Use in a Before & After comparison" aria-label="Use in a Before and After comparison">
-                          <SplitSquareVertical className="w-4 h-4" />
-                        </button>
-                        <a href={a.secure_url} target="_blank" rel="noreferrer" className="p-2 rounded-xl text-slate-400 hover:text-slate-700 hover:bg-slate-100" title="Open original" aria-label="Open original">
-                          <ExternalLink className="w-4 h-4" />
-                        </a>
-                      </div>
-                      <button onClick={() => onDeleteAsset(a.id)} className="p-2 rounded-xl text-slate-400 hover:text-rose-600 hover:bg-rose-50" title="Delete" aria-label={`Delete ${a.original_name}`}>
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+                      )}
                     </div>
-                  </div>
-                </article>
-              ))}
+                  )}
+                  {(active.length > 0 || query) && (
+                    <button onClick={() => { setActive([]); setQuery(''); }} className="text-xs font-bold text-rose-600 hover:underline flex items-center gap-1">
+                      <X className="w-3 h-3" /> Clear filters
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
-          )}
-        </>
+
+            {inFolder.length === 0 ? (
+              <div className="text-center py-14 bg-white/80 rounded-3xl border border-dashed border-sky-200">
+                <ImageIcon className="w-10 h-10 text-sky-400 mx-auto mb-2" />
+                <p className="font-bold text-slate-700">This folder is empty</p>
+                <button onClick={() => setActiveTab('upload')} className="mt-3 text-sm font-bold text-sky-700 hover:underline">Upload photos</button>
+              </div>
+            ) : filtered.length === 0 ? (
+              <div className="text-center py-12 text-slate-500">
+                <p className="font-semibold">No photos match these filters.</p>
+                <button onClick={() => { setQuery(''); setActive([]); }} className="mt-2 text-sm font-bold text-sky-700 hover:underline">Clear filters</button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-5">
+                {filtered.map((a, i) => (
+                  <article
+                    key={a.id}
+                    className="bg-white rounded-2xl overflow-hidden border border-sky-100 shadow-sm hover:shadow-lg hover:-translate-y-0.5 transition-all duration-300 flex flex-col group opacity-0 animate-fade-in"
+                    style={{ animationDelay: `${Math.min(i, 12) * 40}ms`, animationFillMode: 'forwards' }}
+                  >
+                    <button onClick={() => setDetail(a)} className="relative aspect-[4/3] w-full overflow-hidden bg-slate-100" aria-label={`Open ${a.original_name}`}>
+                      <img src={a.thumbnail_url || a.secure_url} alt={a.original_name} loading="lazy" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
+                      <span className={`absolute top-2.5 left-2.5 px-2 py-0.5 rounded-full text-[11px] font-extrabold uppercase ${phaseStyle(a.phase)}`}>{a.phase}</span>
+                    </button>
+
+                    <div className="p-4 flex-1 flex flex-col">
+                      <h4 className="font-bold text-slate-900 truncate" title={a.original_name}>{a.original_name}</h4>
+                      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+                        {!folderId && a.folder && <span className="flex items-center gap-1"><Folder className="w-3 h-3" />{a.folder.name}</span>}
+                        {(a.captured_at || a.uploaded_at) && (
+                          <span className="flex items-center gap-1" title={a.captured_at ? 'Captured (EXIF)' : 'Uploaded'}>
+                            <Calendar className="w-3 h-3" />{fmtDate(a.captured_at || a.uploaded_at)}
+                          </span>
+                        )}
+                        {a.latitude != null && <span className="flex items-center gap-1 text-emerald-700"><MapPin className="w-3 h-3" />GPS</span>}
+                      </div>
+
+                      {a.ai_analysis ? (
+                        <>
+                          <p className="mt-2 text-xs text-slate-600 line-clamp-2 leading-relaxed">{a.ai_analysis.summary}</p>
+                          {a.ai_analysis.visual_signals?.length > 0 && (
+                            <div className="mt-2 flex flex-wrap gap-1">
+                              {a.ai_analysis.visual_signals.slice(0, 3).map((s) => (
+                                <button
+                                  key={s}
+                                  onClick={() => !active.includes(`tag:${s}`) && toggle(`tag:${s}`)}
+                                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-sky-50 text-sky-700 text-[11px] font-semibold border border-sky-100 hover:border-sky-300"
+                                  title={`Filter by ${s}`}
+                                >
+                                  <Tag className="w-2.5 h-2.5" />{s}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </>
+                      ) : (
+                        <button
+                          onClick={() => analyze(a)}
+                          disabled={analyzingId === a.id}
+                          className={`mt-2 self-start text-xs font-bold hover:underline flex items-center gap-1 disabled:opacity-60 ${a.ai_status === 'failed' ? 'text-amber-700' : 'text-sky-700'}`}
+                        >
+                          <Sparkles className={`w-3 h-3 ${analyzingId === a.id ? 'animate-spin' : ''}`} />
+                          {analyzingId === a.id ? 'Analyzing…' : a.ai_status === 'failed' ? 'AI analysis failed · Retry' : 'Not analyzed yet · Analyze'}
+                        </button>
+                      )}
+
+                      <div className="mt-auto pt-3 border-t border-slate-100 flex items-center justify-between">
+                        <div className="flex items-center gap-0.5">
+                          <button onClick={() => { onSelectForUnderstand(a); setActiveTab('buddy'); }} className="p-2 rounded-xl text-sky-600 hover:bg-sky-50" title="Ask Buddy about this photo" aria-label="Ask Buddy about this photo">
+                            <Sparkles className="w-4 h-4" />
+                          </button>
+                          <button onClick={() => { onSelectForCompare(a, a.phase === 'after' ? 'after' : 'before'); setActiveTab('reports'); }} className="p-2 rounded-xl text-indigo-600 hover:bg-indigo-50" title="Use in a Before & After comparison" aria-label="Use in a Before and After comparison">
+                            <SplitSquareVertical className="w-4 h-4" />
+                          </button>
+                          <a href={a.secure_url} target="_blank" rel="noreferrer" className="p-2 rounded-xl text-slate-400 hover:text-slate-700 hover:bg-slate-100" title="Open original" aria-label="Open original">
+                            <ExternalLink className="w-4 h-4" />
+                          </a>
+                        </div>
+                        <button onClick={() => onDeleteAsset(a.id)} className="p-2 rounded-xl text-slate-400 hover:text-rose-600 hover:bg-rose-50" title="Delete" aria-label={`Delete ${a.original_name}`}>
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
       )}
 
       {/* Detail modal */}
@@ -396,7 +479,7 @@ export const ManagementSection: React.FC<ManagementSectionProps> = ({
                 ['Location', detail.latitude != null ? `${detail.latitude.toFixed(5)}, ${detail.longitude?.toFixed(5)}` : 'No GPS'],
                 ['Size', `${detail.width}×${detail.height} · ${fmtSize(detail.bytes || 0)}`],
                 ['Format', (detail.format || '—').toUpperCase()],
-                ['Stored in', detail.is_cloudinary ? (detail.folder?.cloudinary_path || 'Cloudinary') : 'Local storage'],
+                ['Stored in', detail.folder?.cloudinary_path || 'Cloudinary'],
               ].map(([k, v]) => (
                 <div key={k} className="p-3 rounded-xl bg-slate-50 border border-slate-100 min-w-0">
                   <dt className="text-[11px] font-bold uppercase tracking-wider text-slate-500">{k}</dt>
@@ -442,7 +525,7 @@ export const ManagementSection: React.FC<ManagementSectionProps> = ({
                 disabled={analyzingId === detail.id}
                 className="mt-5 px-4 py-2 rounded-xl bg-sky-600 text-white text-sm font-bold flex items-center gap-1.5 disabled:opacity-60"
               >
-                <Sparkles className="w-4 h-4" /> {analyzingId === detail.id ? 'Analyzing…' : 'Analyze with AI'}
+                <Sparkles className="w-4 h-4" /> {analyzingId === detail.id ? 'Analyzing…' : detail.ai_status === 'failed' ? 'Retry AI analysis' : 'Analyze with AI'}
               </button>
             )}
           </div>

@@ -18,12 +18,10 @@ from typing import Any, Dict, List, Optional
 import cloudinary
 import cloudinary.api
 import cloudinary.uploader
+import cloudinary.utils
 from PIL import ExifTags, Image
 
 from app.config import settings
-
-UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 ROOT_FOLDER = (os.getenv("CLOUDINARY_ROOT_FOLDER") or "cloudinary_impact").strip("/ ")
 
@@ -76,18 +74,14 @@ def user_root_folder(user: Any) -> str:
     return f"{ROOT_FOLDER}/{base}-{user.id}"
 
 
-async def ensure_folder(path: str, creds: Optional[Dict[str, str]]) -> bool:
-    if not creds:
-        return False
+async def ensure_folder(path: str, creds: Dict[str, str]) -> None:
+    """Creates the folder in Cloudinary. An existing folder is fine; anything else raises CloudinaryError."""
     try:
         await asyncio.to_thread(cloudinary.api.create_folder, path, **creds)
-        return True
     except Exception as e:
-        # Already exists is fine
         if "exist" in str(e).lower():
-            return True
-        print(f"[Cloudinary] create_folder({path}) failed: {e}")
-        return False
+            return
+        raise CloudinaryError(f"Couldn't create folder '{path}' in Cloudinary: {e}")
 
 
 async def list_subfolders(path: str, creds: Optional[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -187,91 +181,158 @@ async def upload_asset(
     folder_path: str,
     custom_tags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """
-    Uploads the original file into `folder_path`. Raises CloudinaryError if Cloudinary is
-    configured but the upload fails. Only when no Cloudinary account exists at all does it
-    fall back to local disk.
-    """
+    """Uploads the untouched original into `folder_path`. Raises CloudinaryError on any failure."""
+    if not creds:
+        raise CloudinaryError("Cloudinary is not configured on this server.")
     meta = extract_image_metadata(file_bytes)
     tags = [t.strip() for t in (custom_tags or []) if t and t.strip()]
 
-    if creds:
-        def _upload():
-            return cloudinary.uploader.upload(
-                file_bytes,
-                folder=folder_path,              # fixed mode: public_id prefix; dynamic mode: asset folder
-                asset_folder=folder_path,        # dynamic folder mode (ignored by fixed-mode accounts)
-                use_filename=True,
-                unique_filename=True,
-                filename_override=filename,
-                tags=tags or None,
-                resource_type="auto",
-                media_metadata=True,
-                context={"original_filename": filename[:200]},
-                **creds,
-            )
+    def _upload():
+        return cloudinary.uploader.upload(
+            file_bytes,
+            folder=folder_path,              # fixed mode: public_id prefix; dynamic mode: asset folder
+            asset_folder=folder_path,        # dynamic folder mode (ignored by fixed-mode accounts)
+            use_filename=True,
+            unique_filename=True,
+            filename_override=filename,
+            tags=tags or None,
+            resource_type="auto",
+            media_metadata=True,
+            context={"original_filename": filename[:200]},
+            **creds,
+        )
 
-        try:
-            r = await asyncio.to_thread(_upload)
-        except Exception as e:
-            raise CloudinaryError(f"Cloudinary upload failed: {e}")
+    try:
+        r = await asyncio.to_thread(_upload)
+    except Exception as e:
+        raise CloudinaryError(f"Cloudinary upload failed: {e}")
 
-        rtype = r.get("resource_type", "image")
-        urls = delivery_urls(r["public_id"], rtype, creds)
-        return {
-            "public_id": r["public_id"],
-            "secure_url": r["secure_url"],          # untouched original (traceability)
-            "thumbnail_url": urls["thumbnail_url"],
-            "optimized_url": urls["optimized_url"],
-            "format": r.get("format") or meta["format"],
-            "resource_type": rtype,
-            "bytes": r.get("bytes", len(file_bytes)),
-            "width": r.get("width") or meta["width"],
-            "height": r.get("height") or meta["height"],
-            "captured_at": meta["captured_at"],
-            "latitude": meta["latitude"],
-            "longitude": meta["longitude"],
-            "folder": r.get("asset_folder") or folder_path,
-            "cloudinary_tags": r.get("tags") or tags,
-            "cloud_name": creds["cloud_name"],
-            "is_cloudinary": True,
-        }
-
-    # No Cloudinary account configured anywhere: keep the file locally
-    unique = f"{uuid.uuid4().hex[:12]}_{re.sub(r'[^A-Za-z0-9._-]', '_', filename)}"
-    with open(os.path.join(UPLOAD_DIR, unique), "wb") as f:
-        f.write(file_bytes)
-    url = f"/static/uploads/{unique}"
+    rtype = r.get("resource_type", "image")
+    urls = delivery_urls(r["public_id"], rtype, creds)
     return {
-        "public_id": f"local_{unique}",
-        "secure_url": url,
-        "thumbnail_url": url,
-        "optimized_url": url,
-        "format": meta["format"],
-        "resource_type": "image",
-        "bytes": len(file_bytes),
-        "width": meta["width"],
-        "height": meta["height"],
+        "public_id": r["public_id"],
+        "secure_url": r["secure_url"],          # untouched original (traceability)
+        "thumbnail_url": urls["thumbnail_url"],
+        "optimized_url": urls["optimized_url"],
+        "format": r.get("format") or meta["format"],
+        "resource_type": rtype,
+        "bytes": r.get("bytes", len(file_bytes)),
+        "width": r.get("width") or meta["width"],
+        "height": r.get("height") or meta["height"],
         "captured_at": meta["captured_at"],
         "latitude": meta["latitude"],
         "longitude": meta["longitude"],
-        "folder": folder_path,
-        "cloudinary_tags": tags,
-        "cloud_name": None,
-        "is_cloudinary": False,
+        "folder": r.get("asset_folder") or folder_path,
+        "cloudinary_tags": r.get("tags") or tags,
+        "cloud_name": creds["cloud_name"],
     }
 
 
 async def delete_remote_asset(public_id: Optional[str], resource_type: str, creds: Optional[Dict[str, str]]) -> None:
+    """Deletes the original from Cloudinary. Raises CloudinaryError so the app and Cloudinary never drift apart."""
     if not public_id:
         return
-    if public_id.startswith("local_"):
-        p = os.path.join(UPLOAD_DIR, public_id[len("local_"):])
-        if os.path.exists(p):
-            os.remove(p)
-        return
-    if creds:
-        try:
-            await asyncio.to_thread(cloudinary.uploader.destroy, public_id, resource_type=resource_type or "image", invalidate=True, **creds)
-        except Exception as e:
-            print(f"[Cloudinary] destroy({public_id}) failed: {e}")
+    if not creds:
+        raise CloudinaryError("No Cloudinary account holds this asset.")
+    try:
+        await asyncio.to_thread(cloudinary.uploader.destroy, public_id, resource_type=resource_type or "image", invalidate=True, **creds)
+    except Exception as e:
+        raise CloudinaryError(f"Cloudinary delete failed: {e}")
+
+
+# --------------------------------------------------------------------------- studio renders
+
+def _text_layer(text: str, size: int, bold: bool = True) -> Dict[str, Any]:
+    return {"font_family": "Arial", "font_size": size, "font_weight": "bold" if bold else "normal", "text": text}
+
+
+def social_card_url(public_id: str, creds: Dict[str, str], headline: str, caption: str, fmt: str) -> str:
+    """
+    Ready-to-post image built with Cloudinary transformations (no AI-generated pixels).
+    square = 1080x1080 smart crop; story = 1080x1920 photo fitted on a blurred copy of itself.
+    """
+    if fmt == "story":
+        W, H = 1080, 1920
+        base = [
+            {"width": W, "height": H, "crop": "fill", "gravity": "auto"},
+            {"effect": "blur:2000"},
+            {"effect": "brightness:-15"},
+            # the sharp original, fitted (not cropped) in the middle
+            {"overlay": public_id.replace("/", ":"), "width": W, "height": 1350, "crop": "fit"},
+            {"flags": "layer_apply", "gravity": "center"},
+        ]
+    else:
+        W, H = 1080, 1080
+        base = [{"width": W, "height": H, "crop": "fill", "gravity": "auto"}]
+
+    # Text sits on its own solid box (b_ on the text layer) so it stays readable on any photo:
+    # headline at the top, caption at the bottom, wrapped to the card width with c_fit.
+    text = [
+        {"overlay": _text_layer(headline[:60], 60), "color": "white", "background": "rgb:0f172a", "width": W - 120, "crop": "fit"},
+        {"flags": "layer_apply", "gravity": "north", "y": 150 if fmt == "story" else 60},
+    ]
+    if caption:
+        text += [
+            {"overlay": _text_layer(caption[:110], 34, bold=False), "color": "white", "background": "rgb:0369a1", "width": W - 160, "crop": "fit"},
+            {"flags": "layer_apply", "gravity": "south", "y": 150 if fmt == "story" else 60},
+        ]
+    text += [{"fetch_format": "auto"}, {"quality": "auto"}]
+    return cloudinary.CloudinaryImage(public_id).build_url(transformation=base + text, secure=True, cloud_name=creds["cloud_name"])
+
+
+def before_after_url(before_id: str, after_id: str, creds: Dict[str, str], label_before: str = "BEFORE", label_after: str = "AFTER") -> str:
+    """Side-by-side 1600x800 image: before on the left, after on the right, both labelled."""
+    half = 800
+    tr = [
+        {"width": half, "height": half, "crop": "fill", "gravity": "auto"},
+        {"overlay": _text_layer(label_before, 40), "color": "white", "background": "rgb:b45309"},
+        {"flags": "layer_apply", "gravity": "north_west", "x": 24, "y": 24},
+        {"overlay": after_id.replace("/", ":")},
+        {"width": half, "height": half, "crop": "fill", "gravity": "auto"},
+        {"flags": "layer_apply", "gravity": "west", "x": half},
+        {"overlay": _text_layer(label_after, 40), "color": "white", "background": "rgb:047857"},
+        {"flags": "layer_apply", "gravity": "north_east", "x": 24, "y": 24},
+        {"fetch_format": "auto"},
+        {"quality": "auto"},
+    ]
+    return cloudinary.CloudinaryImage(before_id).build_url(transformation=tr, secure=True, cloud_name=creds["cloud_name"])
+
+
+async def create_reel(image_urls: List[str], creds: Dict[str, str], folder_path: str) -> Dict[str, str]:
+    """Combines photos into one animated reel with the Upload API `multi` method. Returns MP4 + GIF URLs."""
+    if len(image_urls) < 2:
+        raise CloudinaryError("A reel needs at least 2 photos.")
+    target = f"{folder_path}/reel-{uuid.uuid4().hex[:10]}"
+
+    def _multi():
+        return cloudinary.uploader.multi(
+            urls=image_urls[:20],
+            public_id=target,
+            transformation=[{"width": 1080, "height": 1080, "crop": "fill", "gravity": "auto"}, {"delay": 1600}],
+            **creds,
+        )
+
+    try:
+        r = await asyncio.to_thread(_multi)
+    except Exception as e:
+        raise CloudinaryError(f"Cloudinary couldn't build the reel: {e}")
+    pid = r.get("public_id") or target
+    # `multi` output is delivered with the "multi" delivery type; changing the extension to .mp4 converts it to video
+    opts = {"type": "multi", "secure": True, "cloud_name": creds["cloud_name"]}
+    gif = r.get("secure_url") or cloudinary.CloudinaryImage(pid).build_url(format="gif", **opts)
+    mp4 = cloudinary.CloudinaryImage(pid).build_url(format="mp4", **opts)
+    return {"public_id": pid, "gif_url": gif, "mp4_url": mp4}
+
+
+def photo_pack_url(public_ids: List[str], creds: Dict[str, str], name: str) -> str:
+    """Signed, 1-hour ZIP download of the untouched originals, built on the fly by Cloudinary."""
+    if not public_ids:
+        raise CloudinaryError("There are no photos to pack.")
+    return cloudinary.utils.download_zip_url(
+        public_ids=public_ids[:1000],
+        resource_type="image",
+        target_public_id=slugify(name, 80),
+        use_original_filename=True,
+        allow_missing=True,
+        **creds,
+    )

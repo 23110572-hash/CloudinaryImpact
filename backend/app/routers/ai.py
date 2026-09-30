@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -67,12 +69,10 @@ async def compare_before_after(req: CompareRequest, user: User = Depends(get_cur
         raise HTTPException(status_code=404, detail="Before or After asset not found")
 
     user_settings = await _get_settings(db, user)
-    comp = await VisionEngine.compare_images(
-        before_bytes=await load_asset_bytes(before_asset.secure_url),
-        after_bytes=await load_asset_bytes(after_asset.secure_url),
-        title=req.title,
-        user_settings=user_settings,
+    before_bytes, after_bytes = await asyncio.gather(
+        load_asset_bytes(before_asset.secure_url), load_asset_bytes(after_asset.secure_url)
     )
+    comp = await VisionEngine.compare_images(before_bytes, after_bytes, req.title, user_settings)
 
     try:
         score = float(comp.get("impact_score", 0) or 0)
@@ -100,8 +100,6 @@ async def compare_before_after(req: CompareRequest, user: User = Depends(get_cur
         "delta_summary": comparison.delta_summary,
         "impact_score": comparison.impact_score,
         "metrics_diff": comparison.metrics_diff,
-        "simulated": bool(comp.get("simulated")),
-        "provider_used": VisionEngine.provider_label(user_settings),
         "created_at": comparison.created_at,
     }
 

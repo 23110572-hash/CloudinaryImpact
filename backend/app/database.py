@@ -5,11 +5,9 @@ from app.config import settings
 import urllib.parse
 
 def _normalize_database_url(url: str):
-    if not url:
-        return "sqlite+aiosqlite:///./cloudinary_impact.db", {"check_same_thread": False}
-    if url.startswith("sqlite"):
-        return url, {"check_same_thread": False}
-    
+    if not url or not url.startswith(("postgres://", "postgresql")):
+        raise RuntimeError("DATABASE_URL must point to a PostgreSQL database (postgresql://...).")
+
     parsed = urllib.parse.urlsplit(url)
     scheme = parsed.scheme
     if scheme in ("postgres", "postgresql"):

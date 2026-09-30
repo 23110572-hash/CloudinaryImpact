@@ -17,11 +17,6 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
       },
-      // Local-storage fallback uploads (used when Cloudinary isn't configured)
-      '/static': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
     },
   },
 })

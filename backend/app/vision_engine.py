@@ -48,7 +48,9 @@ SYSTEM_DEFAULT_MODELS = {
     "groq": "meta-llama/llama-4-scout-17b-16e-instruct",
 }
 
-SIMULATED = "system_simulated"
+
+class AIError(Exception):
+    """Raised when no AI model is connected or the model call fails. Surfaced to the user as an error."""
 
 
 def _system_keys() -> List[Tuple[str, str]]:
@@ -110,7 +112,7 @@ async def test_provider_key(provider: str, api_key: str, model: Optional[str] = 
 class VisionEngine:
     @staticmethod
     def get_effective_provider_and_key(user_settings: Optional[Any] = None) -> Tuple[str, str, str]:
-        """Returns (provider, model, key). BYOK wins when a key is saved; otherwise system keys; else simulated."""
+        """Returns (provider, model, key). BYOK wins when a key is saved; otherwise the platform key. Raises AIError if neither exists."""
         if user_settings and user_settings.llm_mode == "byok":
             prov = (user_settings.active_provider or "").lower()
             keys = user_settings.api_keys or {}
@@ -123,14 +125,7 @@ class VisionEngine:
             if key.strip():
                 return prov, SYSTEM_DEFAULT_MODELS[prov], key.strip()
 
-        return SIMULATED, "none", ""
-
-    @classmethod
-    def provider_label(cls, user_settings: Optional[Any] = None) -> str:
-        prov, model, _ = cls.get_effective_provider_and_key(user_settings)
-        if prov == SIMULATED:
-            return "No AI model configured"
-        return f"{prov} · {model}"
+        raise AIError("No AI model is connected. Add an AI key in Settings.")
 
     @classmethod
     async def generate(
@@ -141,82 +136,61 @@ class VisionEngine:
         images: Optional[List[bytes]] = None,
         json_mode: bool = False,
         history: Optional[List[dict]] = None,
-    ) -> Optional[str]:
-        """Runs the active LLM. Returns None when no live provider is available or the call failed."""
+    ) -> str:
+        """Runs the active LLM and returns its text. Raises AIError on any failure."""
         prov, model, key = cls.get_effective_provider_and_key(user_settings)
-        if prov == SIMULATED:
-            return None
         try:
-            return await call_llm(prov, model, key, system, user_text, images=images, json_mode=json_mode, history=history)
+            text = await call_llm(prov, model, key, system, user_text, images=images, json_mode=json_mode, history=history)
         except (LLMError, httpx.HTTPError) as e:
             print(f"[VisionEngine] {prov}/{model} call failed: {e}")
-            return None
+            raise AIError("The AI model didn't respond. Please try again.") from e
+        if not (text or "").strip():
+            raise AIError("The AI model returned an empty answer. Please try again.")
+        return text
+
+    @classmethod
+    async def generate_json(cls, system: str, user_text: str, user_settings: Optional[Any] = None, images: Optional[List[bytes]] = None, history: Optional[List[dict]] = None) -> Dict[str, Any]:
+        text = await cls.generate(system, user_text, user_settings, images=images, json_mode=True, history=history)
+        try:
+            data = parse_json_response(text)
+        except Exception as e:
+            print(f"[VisionEngine] JSON parse failed: {e}; text={text[:300]!r}")
+            raise AIError("The AI model returned an unreadable answer. Please try again.") from e
+        if not isinstance(data, dict):
+            raise AIError("The AI model returned an unreadable answer. Please try again.")
+        return data
 
     @classmethod
     async def analyze_media(cls, image_bytes: bytes, filename: str, user_settings: Optional[Any] = None) -> Dict[str, Any]:
-        """Structured analysis of a single upload (category, activity, signals, metrics)."""
-        system = "You are an environmental field-media analyst for NGOs. Reply with strict JSON only."
+        """Structured analysis of a single photo. Works for any kind of photo, not only field projects."""
+        system = "You describe photos so they can be searched and turned into stories. Reply with strict JSON only."
         prompt = (
-            "Analyze this field image and return a JSON object with keys:\n"
-            '"summary" (2 sentences), '
-            '"project_category" (one of: Reforestation, Clean Water & Sanitation, Solar & Renewable, '
-            "Ocean & Waste Management, Community Infrastructure, Disaster Resilience, Agriculture, Other), "
+            "Look at this photo and return a JSON object with keys:\n"
+            '"summary" (2 factual sentences about what is visible), '
+            '"project_category" (a short 1-3 word theme you infer from the photo itself, e.g. "Tree planting", '
+            '"Birthday party", "Blood donation camp", "Mountain trip", "Solar installation"), '
             '"activity_detected" (short phrase), '
-            '"visual_signals" (array of 3-8 short lowercase tags for search), '
-            '"environmental_metrics" (object of metric_name -> estimated value, only what is visually supportable), '
+            '"visual_signals" (array of 3-8 short lowercase search tags), '
+            '"environmental_metrics" (object of measurable things you can actually see, e.g. {"people_visible": 12}; empty object if none), '
             '"authenticity_score" (0-1, likelihood the photo is an unedited real capture), '
             '"confidence" (0-1).'
         )
-        text = await cls.generate(system, prompt, user_settings, images=[image_bytes], json_mode=True)
-        if text:
-            try:
-                data = parse_json_response(text)
-                if isinstance(data, dict) and data.get("summary"):
-                    return data
-            except Exception as e:
-                print(f"[VisionEngine] analyze_media JSON parse failed: {e}")
-        return cls._contextual_simulation(filename)
+        data = await cls.generate_json(system, prompt, user_settings, images=[image_bytes])
+        if not data.get("summary"):
+            raise AIError("The AI model didn't describe this photo. Please retry.")
+        return data
 
     @classmethod
-    async def compare_images(cls, before_bytes: Optional[bytes], after_bytes: Optional[bytes], title: str, user_settings: Optional[Any] = None) -> Dict[str, Any]:
-        system = "You compare before/after field photos for sustainability audits. Reply with strict JSON only."
+    async def compare_images(cls, before_bytes: bytes, after_bytes: bytes, title: str, user_settings: Optional[Any] = None) -> Dict[str, Any]:
+        system = "You compare a before photo and an after photo. Reply with strict JSON only."
         prompt = (
-            f"Project: {title}. Image 1 is BEFORE, image 2 is AFTER.\n"
+            f"Context: {title}. Image 1 is BEFORE, image 2 is AFTER.\n"
             "Return JSON with: "
             '"delta_summary" (one paragraph on visible changes, be honest if change is small or unclear), '
             '"impact_score" (0-10 number), '
             '"metrics_diff" (object of 2-5 metric_name -> estimated change string, e.g. "+40%").'
         )
-        if before_bytes and after_bytes:
-            text = await cls.generate(system, prompt, user_settings, images=[before_bytes, after_bytes], json_mode=True)
-            if text:
-                try:
-                    data = parse_json_response(text)
-                    if isinstance(data, dict) and data.get("delta_summary"):
-                        return data
-                except Exception as e:
-                    print(f"[VisionEngine] compare JSON parse failed: {e}")
-
-        return {
-            "delta_summary": (
-                "These photos were not analyzed because no AI model is connected. "
-                "Connect an AI key in Settings to get a real before/after assessment."
-            ),
-            "impact_score": 0,
-            "metrics_diff": {},
-            "simulated": True,
-        }
-
-
-    @staticmethod
-    def _contextual_simulation(filename: str) -> Dict[str, Any]:
-        """Used when no AI model is available: store nothing invented, just mark the asset as not analyzed."""
-        return {
-            "summary": "Not analyzed yet. Connect an AI model in Settings to describe this photo automatically.",
-            "project_category": "Uncategorized",
-            "activity_detected": None,
-            "visual_signals": [],
-            "environmental_metrics": {},
-            "authenticity_score": 0.0,
-            "confidence": 0.0,
-        }
+        data = await cls.generate_json(system, prompt, user_settings, images=[before_bytes, after_bytes])
+        if not data.get("delta_summary"):
+            raise AIError("The AI model didn't describe the change. Please retry.")
+        return data

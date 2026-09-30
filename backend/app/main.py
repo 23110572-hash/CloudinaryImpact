@@ -1,17 +1,19 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 import os
 
 from app.config import settings
 from app.database import engine, Base
 from app import models  # noqa: F401  (registers tables on Base.metadata)
-from app.routers import auth, settings as settings_router, media, ai, reports
-from app.cloudinary_service import UPLOAD_DIR
+from app.routers import auth, settings as settings_router, media, ai, reports, studio
+from app.cloudinary_service import CloudinaryError
+from app.llm_client import LLMError
+from app.vision_engine import AIError
 
 app = FastAPI(
     title="Cloudinary Impact & Sustainability Media Platform",
-    description="AI-Powered Media Intelligence platform for NGOs and Sustainability Teams",
+    description="AI-Powered Media Intelligence platform built on Cloudinary",
     version="1.0.0"
 )
 
@@ -28,8 +30,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount local uploads for fallback static serving
-app.mount("/static/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+# AI and Cloudinary failures are shown to the user as clear errors (no silent fallbacks).
+@app.exception_handler(AIError)
+async def _ai_error(_: Request, exc: AIError):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
+@app.exception_handler(CloudinaryError)
+async def _cloudinary_error(_: Request, exc: CloudinaryError):
+    return JSONResponse(status_code=502, content={"detail": str(exc)})
+
+
+@app.exception_handler(LLMError)
+async def _llm_error(_: Request, exc: LLMError):
+    return JSONResponse(status_code=502, content={"detail": str(exc)})
+
 
 # Include Routers
 app.include_router(auth.router, prefix="/api")
@@ -37,6 +53,7 @@ app.include_router(settings_router.router, prefix="/api")
 app.include_router(media.router, prefix="/api")
 app.include_router(ai.router, prefix="/api")
 app.include_router(reports.router, prefix="/api")
+app.include_router(studio.router, prefix="/api")
 
 @app.get("/")
 async def root():
@@ -54,7 +71,6 @@ async def health_check():
         "status": "healthy",
         "service": "Cloudinary Impact Platform AI",
         "version": settings.VERSION,
-        "default_mode": "system_managed"
     }
 
 @app.on_event("startup")
@@ -92,7 +108,8 @@ def _remove_legacy_seeded_folders(sync_conn):
 # Columns added after the first release. create_all() doesn't alter existing tables, so add them here.
 _NEW_COLUMNS = {
     "users": {"cloudinary_folder": "VARCHAR(255)"},
-    "folders": {"cloudinary_path": "VARCHAR(512)"},
+    "folders": {"cloudinary_path": "VARCHAR(512)", "ideas": "JSON", "ideas_signature": "VARCHAR(128)"},
+    "impact_reports": {"kind": "VARCHAR(32)", "folder_id": "INTEGER", "payload": "JSON"},
 }
 
 

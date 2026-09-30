@@ -265,7 +265,7 @@ export const SettingsSection: React.FC<SettingsSectionProps> = ({ settings, curr
   };
 
   const disconnectCloudinary = () => {
-    if (!window.confirm('Disconnect your Cloudinary account? New uploads will use the system account (or local storage).')) return;
+    if (!window.confirm('Disconnect your Cloudinary account? New uploads will use the platform Cloudinary account.')) return;
     save({ clear_cloudinary: true, cloudinary_cloud_name: undefined, cloudinary_api_key: undefined, cloudinary_api_secret: undefined });
   };
 
@@ -302,7 +302,7 @@ export const SettingsSection: React.FC<SettingsSectionProps> = ({ settings, curr
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3" role="radiogroup" aria-label="AI mode">
               {([
-                { id: 'system', title: 'System Managed', badge: systemAI?.live ? 'Live' : 'Not configured', desc: systemAI?.live ? `Uses the platform's ${systemAI.provider} key (${systemAI.model}). Nothing to set up.` : 'No platform AI key is set on this server yet. Until then, Buddy answers from metadata search only.' },
+                { id: 'system', title: 'System Managed', badge: systemAI?.live ? 'Live' : 'Not configured', desc: systemAI?.live ? `Uses the platform's ${systemAI.provider} key (${systemAI.model}). Nothing to set up.` : 'No platform AI key is set on this server. Add your own key below to use AI features.' },
                 { id: 'byok', title: 'Bring Your Own Key', badge: 'Custom', desc: 'Use your own OpenRouter, OpenAI, Gemini, Claude or Groq key and pick the model.' },
               ] as const).map((opt) => {
                 const active = llmMode === opt.id;
@@ -412,7 +412,7 @@ export const SettingsSection: React.FC<SettingsSectionProps> = ({ settings, curr
                 </p>
               </div>
               <span className={`text-[11px] font-bold px-2.5 py-1 rounded-full ${settings.cloudinary.configured ? 'bg-emerald-100 text-emerald-800' : settings.cloudinary.system_configured ? 'bg-sky-100 text-sky-800' : 'bg-amber-100 text-amber-800'}`}>
-                {settings.cloudinary.configured ? 'Your account' : settings.cloudinary.system_configured ? 'Platform account' : 'Local storage'}
+                {settings.cloudinary.configured ? 'Your account' : settings.cloudinary.system_configured ? 'Platform account' : 'Not configured'}
               </span>
             </div>
 

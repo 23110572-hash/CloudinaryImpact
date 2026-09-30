@@ -26,10 +26,10 @@ The app has six sections:
 | Section | What it does |
 |---|---|
 | **Home** | Explains the workflow and gets people started |
-| **Upload** | Drag and drop photos into a project folder, marked as *Before*, *During*, *After* or *General* |
-| **Media Library** | Every photo organized by folder, phase and location, with search, filters and a detail view |
+| **Upload** | Drop a batch of photos into a folder (marked *Before*, *During*, *After* or *General*). 3 upload in parallel with one progress bar, % and time left |
+| **Media Library** | Folders stacked in a sidebar; pick one to see its photos with search and tag chips (phase, GPS, AI theme, AI tags) |
 | **Buddy** | A chat assistant you can ask things like *"which photos have GPS?"* or *"show me the before photos from the solar site"* |
-| **Reports** | Before & after slider with AI change analysis, plus donor, audit or campaign reports |
+| **Reports** | **Studio**: pick a folder, the AI works out what it is about and suggests what to make, or you type what you need. Plus the before & after slider and history |
 | **Settings** | Account, AI model choice (System Managed or Bring Your Own Key) and optional own Cloudinary account |
 
 ## Architecture
@@ -88,21 +88,27 @@ If a user adds photos to their folder directly from the Cloudinary console, a **
 
 The vision model reads each photo and returns structured JSON: category (e.g. *Reforestation*, *Clean Water & Sanitation*), activity (e.g. *sapling planting*), visual signals (e.g. `saplings`, `mulch rings`, `field team`) and indicators it can actually see. I prompt it to **only report what is visible** and never invent numbers.
 
-If no AI model is connected, I don't fake it. The photo is saved as *"Not analyzed yet"*, and it can be analyzed later with one click once a key is added.
+If analysis fails, nothing is invented: the photo is kept in Cloudinary, marked *"AI analysis failed"*, and can be retried with one click.
 
 ### 3. Before and after comparison
 
 Photos are marked with a phase when they're uploaded. In **Reports → Before & After**, the user picks a baseline and a follow-up photo and gets an interactive split slider. When they run the analysis, I send **both real images** to the vision model. It describes the visible change, gives an impact score, and lists the change in each metric. Every comparison is saved to the history.
 
-### 4. Impact reports and stories
+### 4. Impact reports and stories (Studio)
 
-In **Reports → Impact Report** the user picks a scope (all projects or one folder), an audience and a style:
+Folders can be about anything: a tree planting drive, a blood donation camp, a trip, a birthday. So nothing is hard-coded. In **Reports → Studio** the user picks a folder and the AI reads its photo metadata, works out what the folder is about and suggests 3 things worth making, for the people who would care. The user can also type a request like *"1-page update for the district officer with the 3 best photos"*.
 
-- **Donor**: warm but factual
-- **Audit**: precise and neutral, for M&E teams
-- **Campaign**: short and shareable
+Each suggestion or request is mapped to one of five outputs, all built on real Cloudinary features:
 
-The report is written **only from the user's real data**: number of assets, phases, categories, geotagged share, capture period, comparisons and AI summaries. The model is told to say *"not yet evidenced"* instead of guessing. Reports can be copied, downloaded as Markdown or printed to PDF.
+| Output | How it's made |
+|---|---|
+| Written piece (report, story, recap…) | LLM writes from the folder's real metadata only, ends with links to every source photo |
+| Social post | Square 1080×1080 and story 1080×1920 images with headline + caption text layers (story fits the photo on a blurred copy of itself), plus post text and hashtags |
+| Before & After | Side-by-side 1600×800 image built with layer offsets, plus the vision model's description of the visible change |
+| Highlight reel | Upload API `multi` combines up to 20 photos into an animated GIF, delivered as MP4 too |
+| Photo pack | Signed ZIP of the untouched originals (`download_zip_url`, fresh 1-hour link per click) + a CSV of dates, GPS and tags |
+
+Suggestions are cached per folder until its photos change. No AI-generated pixels are added to evidence photos.
 
 ### 5. Semantic discovery with Buddy
 
@@ -115,7 +121,7 @@ Here is how Buddy works:
 3. It sends the question, the library stats and the matching metadata to the AI model, which answers in plain language and returns the IDs of the photos it's talking about
 4. The chat shows the answer **with the actual matching thumbnails**, and you can click any of them to ask about that specific photo
 
-If no AI model is available, Buddy still answers from the metadata with rule-based search. It says so openly.
+If the AI model is unavailable, Buddy shows an error with a link to connect AI instead of guessing.
 
 ### 6. Traceability
 
@@ -123,6 +129,14 @@ If no AI model is available, Buddy still answers from the metadata with rule-bas
 - Every asset keeps its Cloudinary `public_id`, original URL, folder path, EXIF time and GPS
 - Every report ends with an **evidence appendix** that links each source photo, with its folder, phase, date and coordinates
 - Deleting an asset in the app also deletes it from Cloudinary, so the two never drift apart
+
+## No silent fallbacks
+
+PostgreSQL, Cloudinary and an AI model are required. If one is missing or fails, the user sees a clear error with a retry option instead of a degraded result. If AI analysis fails during upload, the photo is still stored in Cloudinary, counted as failed in the progress bar, and can be re-analyzed with one click.
+
+## Built with the Cloudinary Skills Pack
+
+The `cloudinary-docs` and `cloudinary-transformations` skills from [cloudinary-devs/skills](https://github.com/cloudinary-devs/skills) are installed in `.kiro/skills` and were used to write the Studio's transformation URLs (text layers, blurred-fit story format, side-by-side layers, `f_auto/q_auto`).
 
 ## AI: System Managed or Bring Your Own Key
 

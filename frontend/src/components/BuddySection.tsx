@@ -71,9 +71,6 @@ export const BuddySection: React.FC<BuddySectionProps> = ({ media, attachedAsset
   const aiLive = settings?.llm_mode === 'byok'
     ? !!settings?.masked_keys?.[settings.active_provider]
     : !!settings?.system_ai?.live;
-  const aiLabel = settings?.llm_mode === 'byok'
-    ? `${settings.active_provider} · ${settings.active_model}`
-    : settings?.system_ai?.live ? `System · ${settings.system_ai.model}` : 'Metadata search only';
 
   const send = async (text?: string) => {
     const message = (text ?? input).trim();
@@ -94,7 +91,7 @@ export const BuddySection: React.FC<BuddySectionProps> = ({ media, attachedAsset
     try {
       const res = await api.chat(message, history, attachedAsset?.id);
       setTurns((prev) => [...prev, {
-        role: 'assistant', content: res.answer, assets: res.assets, steps: res.steps, provider: res.provider_used,
+        role: 'assistant', content: res.answer, assets: res.assets, steps: res.steps,
       }]);
     } catch (e: any) {
       setTurns((prev) => [...prev, { role: 'assistant', content: `Sorry, that didn't work: ${e.message}`, error: true }]);
@@ -124,9 +121,8 @@ export const BuddySection: React.FC<BuddySectionProps> = ({ media, attachedAsset
           <span>Buddy</span>
         </div>
         <h2 className="text-3xl sm:text-5xl font-extrabold text-slate-900 tracking-tight">Ask anything about your media</h2>
-        <p className="mt-2 text-base sm:text-lg text-slate-600 max-w-2xl mx-auto">
-          Plain language questions about folders, dates, locations, phases and what's in your photos.
-          Attach a photo to ask about it directly.
+        <p className="mt-2 text-base sm:text-lg text-slate-600 sm:whitespace-nowrap">
+          Ask in plain words about any folder, date, place or photo.
         </p>
       </div>
 
@@ -136,9 +132,9 @@ export const BuddySection: React.FC<BuddySectionProps> = ({ media, attachedAsset
           <div className="flex items-center gap-2 text-xs font-bold text-slate-600 min-w-0">
             <span className="relative flex h-2.5 w-2.5 shrink-0">
               {aiLive && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60" />}
-              <span className={`relative inline-flex rounded-full h-2.5 w-2.5 ${aiLive ? 'bg-emerald-500' : 'bg-amber-400'}`} />
+              <span className={`relative inline-flex rounded-full h-2.5 w-2.5 ${aiLive ? 'bg-emerald-500' : 'bg-rose-500'}`} />
             </span>
-            <span className="truncate">{aiLabel}</span>
+            <span className="truncate">{aiLive ? 'Buddy is online' : 'AI is not connected'}</span>
             {!aiLive && (
               <button onClick={() => onNavigate('settings')} className="text-sky-700 underline underline-offset-2 shrink-0">
                 Connect AI
@@ -146,7 +142,6 @@ export const BuddySection: React.FC<BuddySectionProps> = ({ media, attachedAsset
             )}
           </div>
           <div className="flex items-center gap-3 shrink-0">
-            <span className="hidden sm:inline text-xs font-semibold text-slate-400">{media.length} assets indexed</span>
             {turns.length > 0 && (
               <button
                 onClick={() => setTurns([])}
@@ -250,7 +245,7 @@ export const BuddySection: React.FC<BuddySectionProps> = ({ media, attachedAsset
                       aria-expanded={openSteps === idx}
                     >
                       <Zap className="w-3 h-3" />
-                      <span>How I answered{t.provider ? ` · ${t.provider}` : ''}</span>
+                      <span>How I answered</span>
                       <ChevronDown className={`w-3 h-3 transition-transform ${openSteps === idx ? 'rotate-180' : ''}`} />
                     </button>
                     {openSteps === idx && (

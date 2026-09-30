@@ -3,9 +3,6 @@
 export const BACKEND_URL = ((import.meta as any).env?.VITE_API_URL || '').replace(/\/+$/, '');
 export const API_BASE = `${BACKEND_URL}/api`;
 
-/** Local-fallback uploads are served by the backend at /static/...; make them absolute in production. */
-export const assetUrl = (url?: string | null) => (url && url.startsWith('/static/') ? `${BACKEND_URL}${url}` : url || '');
-
 export interface FolderItem {
   id: number;
   name: string;
@@ -20,8 +17,8 @@ export interface FolderItem {
 }
 
 export interface StorageInfo {
-  mode: 'own' | 'platform' | 'local';
-  cloud_name: string | null;
+  mode: 'own' | 'platform';
+  cloud_name: string;
   root_folder: string;
 }
 
@@ -50,8 +47,9 @@ export interface MediaAssetItem {
   longitude?: number;
   phase: string;
   uploaded_at?: string;
-  ai_status?: 'analyzed' | 'pending';
-  is_cloudinary?: boolean;
+  ai_status: 'analyzed' | 'pending' | 'failed';
+  /** Only set on upload responses when AI analysis failed (the photo itself is stored). */
+  ai_error?: string | null;
   folder?: {
     id: number;
     name: string;
@@ -112,7 +110,6 @@ export interface ChatAsset {
 export interface ChatResponse {
   answer: string;
   assets: ChatAsset[];
-  provider_used: string;
   steps: Array<{ title: string; detail: string }>;
 }
 
@@ -122,8 +119,6 @@ export interface ComparisonResult {
   delta_summary: string;
   impact_score: number;
   metrics_diff: Record<string, any>;
-  simulated?: boolean;
-  provider_used?: string;
   before_url?: string;
   after_url?: string;
   before_name?: string;
@@ -133,12 +128,65 @@ export interface ComparisonResult {
   created_at?: string;
 }
 
+export type CreationKind = 'document' | 'social' | 'before_after' | 'reel' | 'pack';
+
+export interface StudioIdea {
+  title: string;
+  description: string;
+  kind: CreationKind;
+  audience: string;
+  tone: string;
+  prompt: string;
+  asset_ids: number[];
+}
+
+export interface FolderStats {
+  total: number;
+  images: number;
+  analyzed: number;
+  not_analyzed: number;
+  phases: { before: number; during: number; after: number; general: number };
+  geotagged: number;
+  date_range: [string, string] | null;
+  top_tags: string[];
+  themes: string[];
+}
+
+export interface FolderIdeas {
+  folder_id: number;
+  folder_name: string;
+  stats: FolderStats;
+  theme: string;
+  ideas: StudioIdea[];
+}
+
+export interface CreationMedia {
+  format: string;
+  label: string;
+  url: string;
+}
+
+/** A Studio creation (reports from older versions come back as kind "document"). */
 export interface ReportItem {
   id: number;
   title: string;
+  kind: CreationKind;
+  folder_id: number | null;
   category: string;
   markdown_content: string;
   key_metrics: Array<{ label: string; value: string }>;
+  payload: {
+    images?: CreationMedia[];
+    videos?: CreationMedia[];
+    cover_images?: Array<{ id: number; url: string }>;
+    source_ids?: number[];
+    headline?: string;
+    caption?: string;
+    post_text?: string;
+    hashtags?: string[];
+    zip_name?: string;
+    idea?: StudioIdea;
+  };
   created_at: string;
 }
 
@@ -148,6 +196,21 @@ export const AUTH_EXPIRED_EVENT = 'auth:expired';
 function authHeader(): Record<string, string> {
   const token = localStorage.getItem('token');
   return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+function handleUnauthorized(status: number) {
+  if (status === 401 && localStorage.getItem('token')) {
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+    window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+  }
+}
+
+async function errorMessage(res: Response): Promise<string> {
+  const err = await res.json().catch(() => ({}));
+  return typeof err.detail === 'string'
+    ? err.detail
+    : Array.isArray(err.detail) ? err.detail.map((d: any) => d.msg).join(', ') : `Request failed (${res.status})`;
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -160,33 +223,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       ...(init.headers || {}),
     },
   });
-  if (res.status === 401 && localStorage.getItem('token')) {
-    localStorage.removeItem('token');
-    localStorage.removeItem('user');
-    window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
-  }
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    const detail = typeof err.detail === 'string'
-      ? err.detail
-      : Array.isArray(err.detail) ? err.detail.map((d: any) => d.msg).join(', ') : `Request failed (${res.status})`;
-    throw new Error(detail);
-  }
-  return absolutizeUrls(await res.json());
-}
-
-/** Recursively turns backend-relative "/static/..." strings into absolute URLs (no-op when BACKEND_URL is empty). */
-function absolutizeUrls<T>(data: T): T {
-  if (!BACKEND_URL) return data;
-  const walk = (v: any): any => {
-    if (typeof v === 'string') return assetUrl(v);
-    if (Array.isArray(v)) return v.map(walk);
-    if (v && typeof v === 'object') {
-      for (const k of Object.keys(v)) v[k] = walk(v[k]);
-    }
-    return v;
-  };
-  return walk(data);
+  handleUnauthorized(res.status);
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return res.json();
 }
 
 function storeAuth(data: AuthResponse) {
@@ -195,6 +234,23 @@ function storeAuth(data: AuthResponse) {
     localStorage.setItem('user', JSON.stringify(data.user));
   }
   return data;
+}
+
+export interface UploadOptions {
+  folderId?: number;
+  folderName?: string;
+  phase?: string;
+  customTags?: string;
+  signal?: AbortSignal;
+  /** Bytes sent so far for this file (browser → backend). */
+  onBytes?: (loaded: number, total: number) => void;
+}
+
+export class UploadAbortedError extends Error {
+  constructor() {
+    super('Upload cancelled');
+    this.name = 'UploadAbortedError';
+  }
 }
 
 export const api = {
@@ -291,38 +347,44 @@ export const api = {
     return request<MediaAssetItem[]>(`/media?${query.toString()}`);
   },
 
-  uploadMedia(
-    file: File,
-    folderName?: string,
-    customTags?: string,
-    phase: string = 'general',
-    onProgress?: (pct: number) => void
-  ): Promise<any> {
+  /** Uploads one file. Resolves when it is stored in Cloudinary and AI analysis has run (or failed). */
+  uploadMedia(file: File, opts: UploadOptions = {}): Promise<MediaAssetItem> {
     const formData = new FormData();
     formData.append('file', file);
-    if (folderName && folderName.trim()) formData.append('folder_name', folderName.trim());
-    if (customTags && customTags.trim()) formData.append('custom_tags', customTags.trim());
-    formData.append('phase', phase);
+    if (opts.folderId) formData.append('folder_id', String(opts.folderId));
+    else if (opts.folderName?.trim()) formData.append('folder_name', opts.folderName.trim());
+    if (opts.customTags?.trim()) formData.append('custom_tags', opts.customTags.trim());
+    formData.append('phase', opts.phase || 'general');
 
     return new Promise((resolve, reject) => {
+      if (opts.signal?.aborted) return reject(new UploadAbortedError());
       const xhr = new XMLHttpRequest();
       xhr.open('POST', `${API_BASE}/media/upload`);
       const token = localStorage.getItem('token');
       if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
 
+      const onAbort = () => xhr.abort();
+      opts.signal?.addEventListener('abort', onAbort, { once: true });
+
       xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
+        if (e.lengthComputable) opts.onBytes?.(e.loaded, e.total);
       };
       xhr.onload = () => {
+        opts.signal?.removeEventListener('abort', onAbort);
+        handleUnauthorized(xhr.status);
         if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(absolutizeUrls(JSON.parse(xhr.responseText)));
+          resolve(JSON.parse(xhr.responseText));
         } else {
-          let msg = `Upload failed with status ${xhr.status}`;
+          let msg = `Upload failed (${xhr.status})`;
           try { msg = JSON.parse(xhr.responseText).detail || msg; } catch { /* keep default */ }
           reject(new Error(msg));
         }
       };
-      xhr.onerror = () => reject(new Error('Network error during upload'));
+      xhr.onerror = () => {
+        opts.signal?.removeEventListener('abort', onAbort);
+        reject(new Error('Network error during upload'));
+      };
+      xhr.onabort = () => reject(new UploadAbortedError());
       xhr.send(formData);
     });
   },
@@ -349,8 +411,25 @@ export const api = {
     return request<ComparisonResult[]>('/ai/comparisons');
   },
 
-  generateReport(opts: { title: string; folder_id?: number; target_stakeholder: string; tone: string }): Promise<ReportItem> {
-    return request<ReportItem>('/reports/generate', { method: 'POST', body: JSON.stringify(opts) });
+  // ---------- Studio ----------
+
+  getFolderIdeas(folderId: number, refresh = false): Promise<FolderIdeas> {
+    return request<FolderIdeas>(`/studio/folders/${folderId}/ideas${refresh ? '?refresh=true' : ''}`);
+  },
+
+  createCreation(body: { folder_id: number; idea?: StudioIdea; request?: string }): Promise<ReportItem> {
+    return request<ReportItem>('/studio/create', { method: 'POST', body: JSON.stringify(body) });
+  },
+
+  getPackLink(creationId: number): Promise<{ url: string; count: number }> {
+    return request(`/studio/creations/${creationId}/pack-link`);
+  },
+
+  async downloadFolderCsv(folderId: number): Promise<Blob> {
+    const res = await fetch(`${API_BASE}/studio/folders/${folderId}/details.csv`, { headers: authHeader() });
+    handleUnauthorized(res.status);
+    if (!res.ok) throw new Error(await errorMessage(res));
+    return res.blob();
   },
 
   getReports(): Promise<ReportItem[]> {

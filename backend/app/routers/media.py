@@ -1,7 +1,9 @@
+import asyncio
 import os
 from datetime import datetime
 from typing import List, Optional
 
+import cloudinary.api
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -17,7 +19,7 @@ from app.database import get_db
 from app.llm_client import load_asset_bytes
 from app.models import AIAnalysis, Comparison, Folder, MediaAsset, User
 from app.storage import StorageContext, creds_for_url, get_storage
-from app.vision_engine import VisionEngine
+from app.vision_engine import AIError, VisionEngine
 
 router = APIRouter(prefix="/media", tags=["Media Library"])
 
@@ -33,9 +35,8 @@ class FolderCreate(BaseModel):
 
 # --------------------------------------------------------------------------- helpers
 
-def _serialize_asset(a: MediaAsset) -> dict:
+def serialize_asset(a: MediaAsset) -> dict:
     an = a.ai_analysis
-    analyzed = bool(an and (an.confidence or 0) > 0)
     return {
         "id": a.id,
         "original_name": a.original_name,
@@ -52,8 +53,7 @@ def _serialize_asset(a: MediaAsset) -> dict:
         "latitude": a.latitude,
         "longitude": a.longitude,
         "phase": a.phase,
-        "ai_status": "analyzed" if analyzed else "pending",
-        "is_cloudinary": "res.cloudinary.com" in (a.secure_url or ""),
+        "ai_status": a.ai_status if a.ai_status in ("analyzed", "failed") else "pending",
         "folder": {
             "id": a.folder.id, "name": a.folder.name, "color": a.folder.color,
             "icon": a.folder.icon, "cloudinary_path": a.folder.cloudinary_path,
@@ -66,7 +66,7 @@ def _serialize_asset(a: MediaAsset) -> dict:
             "environmental_metrics": an.environmental_metrics or {},
             "authenticity_score": an.authenticity_score,
             "confidence": an.confidence,
-        } if analyzed else None,
+        } if an and a.ai_status == "analyzed" else None,
     }
 
 
@@ -96,14 +96,14 @@ async def _find_or_create_folder(db: AsyncSession, ctx: StorageContext, name: st
     return folder
 
 
-async def _analyze(asset: MediaAsset, image_bytes: Optional[bytes], ctx: StorageContext, db: AsyncSession, extra_tags: List[str]) -> None:
-    """Runs vision analysis if an AI model is available; otherwise stores the asset as not analyzed."""
-    result = await VisionEngine.analyze_media(image_bytes or b"", asset.original_name, ctx.settings) if image_bytes else VisionEngine._contextual_simulation("")
-    signals = list(dict.fromkeys([str(s).lower() for s in (result.get("visual_signals") or [])] + extra_tags))
+async def _analyze(asset: MediaAsset, image_bytes: bytes, ctx: StorageContext, db: AsyncSession, extra_tags: List[str]) -> None:
+    """Runs vision analysis and stores it. Raises AIError if the model is unavailable or fails."""
+    result = await VisionEngine.analyze_media(image_bytes, asset.original_name, ctx.settings)
+    signals = list(dict.fromkeys([str(s).strip().lower() for s in (result.get("visual_signals") or []) if str(s).strip()] + extra_tags))
     existing = (await db.execute(select(AIAnalysis).where(AIAnalysis.asset_id == asset.id))).scalars().first()
     row = existing or AIAnalysis(asset_id=asset.id)
     row.summary = result.get("summary") or ""
-    row.project_category = result.get("project_category") or "Uncategorized"
+    row.project_category = result.get("project_category") or "Other"
     row.activity_detected = result.get("activity_detected")
     row.visual_signals = signals
     row.environmental_metrics = result.get("environmental_metrics") or {}
@@ -111,10 +111,10 @@ async def _analyze(asset: MediaAsset, image_bytes: Optional[bytes], ctx: Storage
     row.confidence = float(result.get("confidence") or 0)
     if not existing:
         db.add(row)
-    asset.ai_status = "analyzed" if row.confidence > 0 else "pending"
+    asset.ai_status = "analyzed"
 
 
-async def _load_asset(db: AsyncSession, user: User, asset_id: int) -> MediaAsset:
+async def load_owned_asset(db: AsyncSession, user: User, asset_id: int) -> MediaAsset:
     a = (await db.execute(
         select(MediaAsset).options(selectinload(MediaAsset.ai_analysis), selectinload(MediaAsset.folder))
         .where(MediaAsset.id == asset_id, MediaAsset.user_id == user.id)
@@ -129,11 +129,7 @@ async def _load_asset(db: AsyncSession, user: User, asset_id: int) -> MediaAsset
 @router.get("/storage")
 async def storage_info(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     ctx = await get_storage(db, user)
-    return {
-        "mode": ctx.mode,
-        "cloud_name": ctx.creds["cloud_name"] if ctx.creds else None,
-        "root_folder": ctx.root,
-    }
+    return {"mode": ctx.mode, "cloud_name": ctx.creds["cloud_name"], "root_folder": ctx.root}
 
 
 # --------------------------------------------------------------------------- folders
@@ -177,12 +173,12 @@ async def delete_folder(folder_id: int, user: User = Depends(get_current_user), 
     if count:
         raise HTTPException(status_code=400, detail="Folder isn't empty. Delete or move its media first.")
     ctx = await get_storage(db, user)
-    if ctx.creds and folder.cloudinary_path:
-        import asyncio, cloudinary.api
+    if folder.cloudinary_path:
         try:
             await asyncio.to_thread(cloudinary.api.delete_folder, folder.cloudinary_path, **ctx.creds)
         except Exception as e:
-            print(f"[Cloudinary] delete_folder failed (continuing): {e}")
+            if "not found" not in str(e).lower() and "can't find" not in str(e).lower():
+                raise CloudinaryError(f"Couldn't delete the folder in Cloudinary: {e}")
     await db.delete(folder)
     await db.commit()
     return {"status": "success"}
@@ -200,6 +196,10 @@ async def upload_media(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Stores the original in Cloudinary, then runs AI analysis.
+    If analysis fails the photo is kept (ai_status = "failed", ai_error set) so it can be retried.
+    """
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
@@ -226,9 +226,9 @@ async def upload_media(
     filename = os.path.basename(file.filename or "upload.jpg")
     try:
         up = await upload_asset(content, filename, ctx.creds, folder.cloudinary_path, tags + [f"phase-{phase}"])
-    except CloudinaryError as e:
+    except CloudinaryError:
         await db.rollback()
-        raise HTTPException(status_code=502, detail=str(e))
+        raise
 
     asset = MediaAsset(
         user_id=user.id,
@@ -251,10 +251,22 @@ async def upload_media(
     )
     db.add(asset)
     await db.flush()
-
-    await _analyze(asset, content if asset.resource_type == "image" else None, ctx, db, tags)
+    folder.ideas_signature = None  # folder content changed: Studio ideas must be refreshed
     await db.commit()
-    return _serialize_asset(await _load_asset(db, user, asset.id))
+
+    ai_error = None
+    if asset.resource_type == "image":
+        try:
+            await _analyze(asset, content, ctx, db, tags)
+        except AIError as e:
+            asset.ai_status = "failed"
+            ai_error = str(e)
+        await db.commit()
+
+    db.expire_all()
+    out = serialize_asset(await load_owned_asset(db, user, asset.id))
+    out["ai_error"] = ai_error
+    return out
 
 
 # --------------------------------------------------------------------------- list / detail / delete
@@ -291,24 +303,27 @@ async def list_media(
             ])).lower()
             if q not in hay:
                 continue
-        out.append(_serialize_asset(a))
+        out.append(serialize_asset(a))
     return out
 
 
 @router.post("/{asset_id}/analyze")
 async def analyze_asset(asset_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    """(Re)runs AI analysis on an asset, e.g. after connecting an AI key or for synced assets."""
-    asset = await _load_asset(db, user, asset_id)
+    """(Re)runs AI analysis on an asset, e.g. after a failed analysis or for synced assets."""
+    asset = await load_owned_asset(db, user, asset_id)
     ctx = await get_storage(db, user)
-    if VisionEngine.get_effective_provider_and_key(ctx.settings)[0] == "system_simulated":
-        raise HTTPException(status_code=400, detail="No AI model is connected. Add a key in Settings first.")
     image_bytes = await load_asset_bytes(asset.secure_url)
-    if not image_bytes:
-        raise HTTPException(status_code=502, detail="Couldn't download the original from Cloudinary")
-    await _analyze(asset, image_bytes, ctx, db, [])
+    try:
+        await _analyze(asset, image_bytes, ctx, db, [])
+    except AIError:
+        asset.ai_status = "failed"
+        await db.commit()
+        raise
+    if asset.folder:
+        asset.folder.ideas_signature = None
     await db.commit()
     db.expire_all()
-    return _serialize_asset(await _load_asset(db, user, asset_id))
+    return serialize_asset(await load_owned_asset(db, user, asset_id))
 
 
 @router.patch("/{asset_id}")
@@ -318,19 +333,19 @@ async def update_asset(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    asset = await _load_asset(db, user, asset_id)
+    asset = await load_owned_asset(db, user, asset_id)
     if phase:
         if phase not in ALLOWED_PHASES:
             raise HTTPException(status_code=400, detail="Invalid phase")
         asset.phase = phase
     await db.commit()
     db.expire_all()
-    return _serialize_asset(await _load_asset(db, user, asset_id))
+    return serialize_asset(await load_owned_asset(db, user, asset_id))
 
 
 @router.delete("/{asset_id}")
 async def delete_asset(asset_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    asset = await _load_asset(db, user, asset_id)
+    asset = await load_owned_asset(db, user, asset_id)
     ctx = await get_storage(db, user)
     await delete_remote_asset(asset.cloudinary_public_id, asset.resource_type, creds_for_url(asset.secure_url, ctx))
     # Comparisons referencing this asset would point at nothing
@@ -338,6 +353,8 @@ async def delete_asset(asset_id: int, user: User = Depends(get_current_user), db
         (Comparison.before_asset_id == asset.id) | (Comparison.after_asset_id == asset.id)
     ))).scalars().all():
         await db.delete(c)
+    if asset.folder:
+        asset.folder.ideas_signature = None
     await db.delete(asset)
     await db.commit()
     return {"status": "success"}
@@ -352,12 +369,7 @@ async def sync_from_cloudinary(user: User = Depends(get_current_user), db: Async
     (e.g. via the Cloudinary console): new subfolders become folders, new files become assets.
     """
     ctx = await get_storage(db, user)
-    if not ctx.creds:
-        raise HTTPException(status_code=400, detail="No Cloudinary account is configured")
-    try:
-        subfolders = await list_subfolders(ctx.root, ctx.creds)
-    except CloudinaryError as e:
-        raise HTTPException(status_code=502, detail=f"Couldn't read Cloudinary: {e}")
+    subfolders = await list_subfolders(ctx.root, ctx.creds)
 
     known_ids = set((await db.execute(
         select(MediaAsset.cloudinary_public_id).where(MediaAsset.user_id == user.id)
@@ -372,14 +384,10 @@ async def sync_from_cloudinary(user: User = Depends(get_current_user), db: Async
             folder = await _find_or_create_folder(db, ctx, sf["name"])
             folder.cloudinary_path = sf["path"]
             new_folders += 1
-        try:
-            resources = await list_folder_resources(sf["path"], ctx.creds)
-        except CloudinaryError as e:
-            print(f"[sync] {sf['path']}: {e}")
-            continue
+        resources = await list_folder_resources(sf["path"], ctx.creds)
         for r in resources:
             pid = r.get("public_id")
-            if not pid or pid in known_ids:
+            if not pid or pid in known_ids or "/reel-" in pid:
                 continue
             rtype = r.get("resource_type", "image")
             urls = delivery_urls(pid, rtype, ctx.creds)
@@ -399,6 +407,7 @@ async def sync_from_cloudinary(user: User = Depends(get_current_user), db: Async
                 phase=phase, ai_status="pending",
             )
             db.add(a)
+            folder.ideas_signature = None
             known_ids.add(pid)
             new_assets += 1
     await db.commit()

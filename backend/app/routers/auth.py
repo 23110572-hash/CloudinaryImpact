@@ -5,7 +5,7 @@ from sqlalchemy import select, func
 from app.database import get_db
 from app.models import User, UserSettings, Folder
 from app.auth import get_password_hash, verify_password, create_access_token, get_current_user
-from app.cloudinary_service import user_root_folder, ensure_folder, system_credentials
+from app.cloudinary_service import CloudinaryError, user_root_folder, ensure_folder, system_credentials
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -41,6 +41,10 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if res.scalars().first():
         raise HTTPException(status_code=400, detail="Email already registered")
 
+    creds = system_credentials()
+    if not creds:
+        raise CloudinaryError("Cloudinary is not configured on this server.")
+
     user = User(
         email=email,
         hashed_password=get_password_hash(req.password),
@@ -54,11 +58,11 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     db.add(settings)
 
     # Every account gets its own private folder in Cloudinary (platform account by default).
-    # No pre-seeded sub-folders: those come from the user's own uploads.
+    # Created before commit so a Cloudinary failure doesn't leave a half-made account.
     user.cloudinary_folder = user_root_folder(user)
+    await ensure_folder(user.cloudinary_folder, creds)
     await db.commit()
     await db.refresh(user)
-    await ensure_folder(user.cloudinary_folder, system_credentials())
 
     token = create_access_token({"sub": str(user.id)})
     return {

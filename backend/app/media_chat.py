@@ -17,8 +17,8 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import MediaAsset
-from app.vision_engine import VisionEngine
-from app.llm_client import load_asset_bytes, parse_json_response
+from app.vision_engine import AIError, VisionEngine
+from app.llm_client import load_asset_bytes
 
 MONTHS = {m: i for i, m in enumerate(
     ["january", "february", "march", "april", "may", "june", "july",
@@ -129,45 +129,6 @@ def _retrieve(message: str, records: List[Dict[str, Any]]) -> List[Dict[str, Any
     return [r for _, r in scored]
 
 
-def _fallback_answer(message: str, records: List[Dict[str, Any]], matches: List[Dict[str, Any]], stats: Dict[str, Any]) -> str:
-    q = message.lower()
-    if not records:
-        return "Your Media Library is empty. Upload some field photos first, then ask me about them."
-
-    lines: List[str] = []
-    if any(w in q for w in ["how many", "count", "number of", "total"]):
-        lines.append(f"You have **{stats['total_assets']}** assets in your library.")
-        if matches and len(matches) != len(records):
-            lines.append(f"**{len(matches)}** of them match your question.")
-    if "folder" in q:
-        lines.append("**Folders:**")
-        lines += [f"- {k}: {v} asset(s)" for k, v in stats["by_folder"].items()]
-    if any(w in q for w in ["gps", "location", "coordinates", "where", "map"]):
-        lines.append(f"**{stats['with_gps']}** of {stats['total_assets']} assets have GPS coordinates in their EXIF data.")
-    if any(w in q for w in ["summary", "summarize", "overview", "everything"]):
-        lines.append("**Library overview**")
-        lines.append(f"- Phases: " + ", ".join(f"{k} ({v})" for k, v in stats["by_phase"].items()))
-        lines.append(f"- Categories: " + ", ".join(f"{k} ({v})" for k, v in stats["by_category"].items()))
-        if stats["captured_range"]:
-            lines.append(f"- Captured between {stats['captured_range'][0]} and {stats['captured_range'][1]}")
-
-    if matches:
-        lines.append(f"\nI found **{len(matches)}** matching asset(s):")
-        for r in matches[:8]:
-            bits = [r["folder"] or "Unfiled", r["phase"]]
-            if r["captured_at"]:
-                bits.append(r["captured_at"][:10])
-            if r["latitude"] is not None:
-                bits.append(f"GPS {r['latitude']:.4f}, {r['longitude']:.4f}")
-            lines.append(f"- **{r['name']}** ({' · '.join(bits)})" + (f": {r['summary']}" if r["summary"] else ""))
-    elif not lines:
-        lines.append("I couldn't find assets matching that. Try asking by folder, phase (before/after), month, "
-                     "GPS, or a visual tag like *solar* or *trees*.")
-
-    lines.append("\n_Answered from your metadata without an AI model. Connect an AI key in Settings for richer answers._")
-    return "\n".join(lines)
-
-
 async def run_media_chat(
     db: AsyncSession,
     user_id: int,
@@ -204,7 +165,8 @@ async def run_media_chat(
         r["summary"] = (r["summary"] or "")[:240] or None
 
     system = (
-        "You are the Media Library assistant for an NGO impact platform built on Cloudinary. "
+        "You are Buddy, the assistant for a media library built on Cloudinary. The photos can be about anything "
+        "(field projects, events, trips, campaigns, daily life). "
         "Answer questions about the user's field photos using ONLY the metadata provided (and the attached image if any). "
         "Be concise and friendly, use short markdown (bold, bullet lists). If the data can't answer, say so and suggest "
         "what metadata would help. Never invent assets, numbers, locations, or dates.\n"
@@ -219,26 +181,16 @@ async def run_media_chat(
     )
     trimmed_history = [h for h in (history or []) if h.get("content")][-8:]
 
-    answer = None
-    asset_ids: List[int] = []
-    text = await VisionEngine.generate(
+    data = await VisionEngine.generate_json(
         system, user_text, user_settings,
         images=[image_bytes] if image_bytes else None,
-        json_mode=True, history=trimmed_history,
+        history=trimmed_history,
     )
-    if text:
-        try:
-            data = parse_json_response(text)
-            answer = data.get("answer")
-            asset_ids = [int(i) for i in data.get("asset_ids", []) if str(i).isdigit() and int(i) in by_id]
-        except Exception:
-            answer = text  # Model ignored JSON format; show its text as-is
-        steps.append({"title": "AI answer", "detail": VisionEngine.provider_label(user_settings)})
-
+    answer = str(data.get("answer") or "").strip()
     if not answer:
-        answer = _fallback_answer(message, records, matches, stats)
-        asset_ids = [m["id"] for m in matches[:12]]
-        steps.append({"title": "Metadata answer", "detail": "No AI model available, answered with rule-based search"})
+        raise AIError("Buddy didn't get an answer from the AI model. Please try again.")
+    asset_ids = [int(i) for i in data.get("asset_ids", []) if str(i).isdigit() and int(i) in by_id]
+    steps.append({"title": "Answer", "detail": "Written by AI from your library metadata"})
 
     if attached and attached.id not in asset_ids:
         asset_ids.insert(0, attached.id)
@@ -246,7 +198,6 @@ async def run_media_chat(
     return {
         "answer": answer,
         "assets": [_public(by_id[i]) for i in asset_ids[:12]],
-        "provider_used": VisionEngine.provider_label(user_settings) if text else "Metadata search",
         "steps": steps,
         "stats": stats,
     }

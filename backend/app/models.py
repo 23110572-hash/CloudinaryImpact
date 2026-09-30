@@ -32,7 +32,7 @@ class UserSettings(Base):
     
     # Active Provider: "openrouter", "openai", "gemini", "anthropic", "groq", "bedrock"
     active_provider = Column(String(64), default="openrouter")
-    active_model = Column(String(128), default="google/gemini-flash-1.5")
+    active_model = Column(String(128), default="google/gemini-2.5-flash")
     
     # Dictionary storing keys per provider: {"openai": "sk-...", "anthropic": "sk-ant-...", ...}
     api_keys = Column(JSON, default={})
@@ -58,6 +58,9 @@ class Folder(Base):
     icon = Column(String(64), default="Folder")
     # Full Cloudinary path, always inside the owner's root folder
     cloudinary_path = Column(String(512), nullable=True)
+    # Studio: AI-suggested creations for this folder, cached until its photos change
+    ideas = Column(JSON, nullable=True)
+    ideas_signature = Column(String(128), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="folders")
@@ -143,6 +146,11 @@ class ImpactReport(Base):
     project_category = Column(String(128), default="Sustainability Impact")
     markdown_content = Column(Text, nullable=False)
     key_metrics = Column(JSON, default=[])
+    # Studio creation type: document | social | before_after | reel | pack
+    kind = Column(String(32), default="document")
+    folder_id = Column(Integer, nullable=True)
+    # Renderer output: image URLs, captions, source asset ids, etc.
+    payload = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="reports")

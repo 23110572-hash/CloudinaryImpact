@@ -7,12 +7,9 @@ callers can fall back gracefully.
 """
 import base64
 import json
-import os
 from typing import List, Optional
 
 import httpx
-
-from app.cloudinary_service import UPLOAD_DIR
 
 
 class LLMError(Exception):
@@ -40,25 +37,16 @@ def _guess_mime(data: bytes) -> str:
     return "image/jpeg"
 
 
-async def load_asset_bytes(url: Optional[str]) -> Optional[bytes]:
-    """Loads image bytes from a Cloudinary/remote URL or the local fallback upload dir."""
-    if not url:
-        return None
+async def load_asset_bytes(url: str) -> bytes:
+    """Downloads an original from Cloudinary. Raises LLMError if it can't be fetched."""
     try:
-        if url.startswith("/static/uploads/"):
-            path = os.path.join(UPLOAD_DIR, os.path.basename(url))
-            if os.path.exists(path):
-                with open(path, "rb") as f:
-                    return f.read()
-            return None
-        if url.startswith("http"):
-            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    return resp.content
-    except Exception as e:
-        print(f"[llm_client] Could not load asset bytes from {url}: {e}")
-    return None
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError as e:
+        raise LLMError(f"Couldn't download the photo from Cloudinary: {e}") from e
+    if resp.status_code != 200 or not resp.content:
+        raise LLMError(f"Couldn't download the photo from Cloudinary (HTTP {resp.status_code}).")
+    return resp.content
 
 
 async def call_llm(

@@ -61,7 +61,7 @@ const STEPS = [
   { tab: 'upload', icon: UploadCloud, title: 'Upload', color: 'from-sky-500 to-sky-600', text: 'Drop field photos into a project folder and tag them Before, During or After. Cloudinary optimizes and auto-tags them; EXIF GPS and timestamps are extracted.' },
   { tab: 'library', icon: Images, title: 'Media Library', color: 'from-blue-500 to-blue-600', text: 'Browse everything by folder, phase, location and AI-detected signals. Search finds photos by what is in them.' },
   { tab: 'buddy', icon: MessageCircleHeart, title: 'Buddy', color: 'from-indigo-500 to-indigo-600', text: 'Ask in plain language: "which photos have GPS?", "show before photos of the solar site". Attach a photo to ask about it.' },
-  { tab: 'reports', icon: FileBarChart, title: 'Reports', color: 'from-violet-500 to-violet-600', text: 'Compare before & after with a slider and AI change analysis, then generate donor-ready reports that link to every source asset.' },
+  { tab: 'reports', icon: FileBarChart, title: 'Reports', color: 'from-violet-500 to-violet-600', text: 'Pick a folder and the Studio suggests what to make: reports, social posts, before & after stories, reels or photo packs, all linked to the source photos.' },
 ];
 
 export const HomeSection: React.FC<HomeSectionProps> = ({ isLoggedIn, mediaCount, folderCount, onNavigate }) => {
